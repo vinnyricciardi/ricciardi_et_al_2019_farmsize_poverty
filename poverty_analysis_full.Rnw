@@ -1,0 +1,4157 @@
+\documentclass{article}
+
+\title{Annotated analysis for:\\Are the poorest farmers the most productive?\\Examining how to define smallholders to monitor SDG 2}
+\author{Ricciardi et al.\\vinnyricciardi@gmail.com}
+\usepackage[margin=2.5 cm]{geometry}
+\usepackage{color}
+\usepackage[parfill]{parskip}
+%\usepackage{lineno}
+\usepackage{hyperref}
+\usepackage{subfig}
+\usepackage{float}
+\usepackage[style=numeric-comp, sorting=none, 
+            maxnames=1, bibencoding=utf8, backend=bibtex]{biblatex}
+% \linenumbers
+\bibliography{Rpackages.bib}
+%\usepackage{tgadventor} % fonts
+%\renewcommand{\familydefault}{\sfdefault}
+\renewenvironment{knitrout}{\vspace{2em}}{}
+
+
+\input{ReferencesPapersTex} 
+\begin{document}
+
+
+<<include=FALSE>>=
+startTime <- Sys.time()
+
+require(knitr)
+require(printr)
+require(formatR)
+opts_chunk$set(concordance  = TRUE,
+               fig.align    = 'center',
+               fig.pos      = 'H',  # no floating
+               crop         = hook_pdfcrop,
+               comment      = NA,
+               message      = FALSE,
+               warning      = FALSE,
+               results      = 'asis',
+               error        = FALSE,
+               cache        = T,
+               cache.lazy   = F,
+               include      = TRUE,
+               width.cutoff = 60)
+
+options(digits = 3)
+@ 
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\maketitle
+
+\tableofcontents
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\section{Reproducibility}
+
+We use the \textbf{R} packages \texttt{knitr}  and \texttt{checkpoint} \cite{R-knitr, R-checkpoint}. The package \texttt{knitr} facilitates producing a dynamic document that contains all the steps required to analyze the data. \texttt{checkpoint()} will install all packages versions for you that we used in our analysis to avoid result discrepancies that may arise from software differences. Thus the reader is provided with all the data and code to fully reproduce the analysis, and adapt or repurpose it for another analyses. 
+
+Please see the published manuscript for this study's motivation, research questions, and methodology. The purpose of this document is for transparency and reproducability of our analysis.
+
+<<checkPoint,out.width='60',message=FALSE, warning=FALSE, eval=F, echo=F>>=
+library('checkpoint')
+checkpoint(snapshotDate = '2019-02-01')
+@
+
+%%%%%%%%%%%%%%%%%%%%%%%%
+%% Ref for packages
+<<loadpackages,out.width='60', results='hide', echo=F>>=
+packages <- c('checkpoint',
+              'RColorBrewer',
+              'cowplot',
+              'data.table',
+              'DHARMa',
+              'dplyr',
+              'foreach',
+              'ggalt',
+              'ggplot2',
+              'glmmTMB',
+              'nlme',
+              'gridExtra',
+              'lattice',
+              'lme4',
+              'lmtest',
+              'parallel',
+              'reshape2',
+              'RLRsim',
+              'robustlmm',
+              'rworldmap',
+              'sandwich',
+              'stargazer',
+              'stringr',
+              'xtable')
+
+
+# Installs required packages not currently installed
+new_packages <- packages[!(packages %in% installed.packages()[,'Package'])]
+if(length(new_packages)) install.packages(new_packages)
+lapply(packages, require, character = TRUE)
+@
+<<echo=F, include=F>>=
+c <- paste0('R-', packages)
+c <- paste0('\\Sexpr{',c,'}', '\\cite{', c,'}')
+write_bib(x = packages, file = 'Rpackages.bib')
+@
+ 
+For the analysis in this document we will be using the following packages: \Sexpr{c}.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\section{Data}
+
+<<echo=F>>=
+# TODO: before sharing, add in how combined all data to one file.
+df <- fread('../data/all_data_merged_hh.csv', 
+            stringsAsFactors = F, 
+            colClasses = c(hhid = 'character'))
+df$id <- paste0(df$country, df$year, df$hhid)
+
+# There was an oddity where crop income > crop revenue at times
+# certain countries had a lot of values; most likely a reporting issue
+# # total 1.55\%
+# tmp <- df %>% 
+#   mutate(cy = paste0(country, '_', year)) %>%
+#   select(cy, crop, cropvp) %>%
+#   na.omit() %>%
+#   group_by(cy) %>% 
+#   mutate(tot_n = n()) %>% 
+#   filter(crop > cropvp) %>% 
+#   summarise(p = 100 * n() / max(tot_n))
+# 
+# ggplot(tmp, aes(x = reorder(cy, p), y = p)) +
+#   geom_bar(stat = 'identity') +
+#   coord_flip() +
+#   xlab('') +
+#   ylab("Percent of households reporting\ncrop income ('crop') > crop revenue ('cropvp')")
+
+@
+
+We prepare the RuLIS data by taking the most recent survey year per country.
+
+<<echo=F>>=
+df <- df %>%
+  group_by(country) %>%
+  mutate(recentYear = max(year, na.rm = T)) %>%
+  filter(year == recentYear)
+@
+
+Next, since the survey weights are drastically different per country (e.g., India ranges from 154 to 156648, while Armenia ranges from 18 to 337) and we will test using weights in weighted regressions, we normalize the weights per country by dividing each weight by the maximum to achieve a 0 to 1 scale. We keep the original weight as they will be useful for population estimates. We also keep the expansion factors, primary sampling unit, community identifier, subnational regional identifier, urban/rural dummy, and add a global regional variable (i.e., continent and subcontinental regions) by relying on Lowder et al.'s (@016) classifications based on the World Census of Agriculture.
+
+<<echo=F>>=
+df <- df %>% 
+  group_by(country) %>% 
+  mutate(weight_hh_adj = weight_hh / max(weight_hh))
+
+df_weights <- df[, c('id',
+                     'country',
+                     'hhsize',  # size of household
+                     'weight_hh',  # sampling weight
+                     'weight_hh_adj', # weight between 0 and 1 per country
+                     'ExpFact',     # Weight_hh*hhsize
+                     'psu',   # Code of the Primary Sampling Unit from which households are selected. It corresponds to the smallest geographical aggregate available.
+                     'region',  # state, district, etc
+                     # 'com_id',  # community identifier
+                     'urban'  # urban (1), rural (0) dummy
+                     )]
+
+# Some countries do not have region, community ids, psu or some entires are labeled as '.'
+# unique(df_weights[which(df_weights$region == '.'),]$country)
+# unique(df_weights[which(is.na(df_weights$region)),]$country)
+
+df_weights$region <- ifelse(is.na(df_weights$region), 1, df_weights$region)
+df_weights$psu <- ifelse(is.na(df_weights$psu), 1, df_weights$psu)
+
+
+# Add in lowder's continental regions
+worldregions <- read.csv('../data/lowder_region_classes.csv')
+df_weights <- merge(df_weights, worldregions, by = 'country', all.x = T, all.y = F)
+df_weights$country <- NULL # prevents later dublication
+@
+
+<<echo=F>>=
+# Here is a convienience subset of the data for our analysis.
+
+variable_lists <- list(
+  general      = c('com_id', 'country', 'hhid', 'id', 
+                   'region', 'year', 'ag_part'),
+  demographics = c('hhsize', 'dsmall', 'femhead', 
+                   'flaborshare', 'famdays', 'labtot', 'quinttot'),
+  inc_total    = c('totincome'),
+  inc_onfarm   = c('agrincome', 'crop', 'cropown', 
+                   'cropvp', 'livestock', 'livbysold', 'livstvp'),
+  inc_offfarm  = c('wge1', 'wge2', 'wge3', 'wge4'),
+  inc_other    = c('farmrntinc', 'fishvp', 'fishery', 
+                   'forestvp', 'forestry', 'fininc', 'int_rem', 
+                   'nofarmrnt', 'otherinc', 'priv_trans'),
+  exp_total    = c('hhexp'),
+  exp_onfarm   = c('chemexp', 'croplost', 'farmrntexp', 
+                   'impseedexp', 'infertexp', 'laborexp', 'totenexp'),
+  exp_other    = c('foodexp'),
+  farm_size    = c('farm_area', 'landown', 'TLU_total', 'crop_land', 'cultivated'),
+  mgmt         = c('itotlandcul', 'rtotlandcul')
+)
+
+# Select variables
+df_hh <- df %>% select(unlist(variable_lists, use.names = F))
+
+# Wide to long form
+df_hh <- melt(df_hh, id.vars = unlist(variable_lists[c(1:2, 10:11)], use.names = F))
+
+# Add variable grouping category
+df_hh$grouping <- NA
+for (i in 3: 9) {
+  df_hh$grouping <- ifelse(df_hh$variable %in% 
+                             unlist(variable_lists[i], 
+                                    use.names = F), 
+                           names(variable_lists)[i], 
+                           df_hh$grouping)
+}
+@
+
+<<echo=F>>=
+# Then, we define farm size according to the RuLIS definition of farm size, according to per country availability, as cropland, cultivated land, operated farm area, or tropical livestock units. See latter section for variable overview and coverage.
+
+df_hh$landown <- ifelse(!is.na(df_hh$crop_land) & df_hh$crop_land > 0., df_hh$crop_land,
+                 ifelse(!is.na(df_hh$cultivated) & df_hh$cultivated > 0., df_hh$cultivated,
+                 ifelse(!is.na(df_hh$farm_area) & df_hh$farm_area > 0., df_hh$farm_area,
+                 ifelse(!is.na(df_hh$TLU_total) & df_hh$TLU_total > 0., df_hh$TLU_total, NA))))
+@
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Standardizing monetary units}
+
+To accommodate different survey years and countries, we convert the income and expenditure data into their 2011 purchasing power parity (PPP) value equivalents. We choose 2011 as our base year because the World Bank has per capita GDP data in PPP using 2011 as a base year. The World Bank dataset will be a helpful benchmark to a) ensure our conversions to PPP in 2011 values are accurate and b) to check if the RuLIS data are similar to the national GDP per capita. \emph{To make the latter comparison, we will need to adjust for GDP from agricultural households (see next section).}
+
+In order to convert RuLIS's values to their 2011 PPP values, we first convert all local currency units (LCU) to the 2011 base year, then we convert the LCU in the 2011 base year to their 2011 PPP equivalents. To convert the LCUs to the 2011 base year, we use the World Bank time series where all LCU are in the 2010 base year value. Then we rescale this time series so 2011 is the base year. While the World Bank has data for each country's per capita GDP PPP in 2011 values from 1960-2017, their only available time series of constant LCUs is for a base year of 2010. For clarity, the term 'current' refers to if a value is in its current year's value terms (e.g., 2017 GDP in 2017 values; also called 'actual' in literature), while the term 'constant' refers to if a value is in a base year's value terms (e.g., 2017 GDP in 2011 values; also called 'real' in literature).
+
+First we rescale the LCU to a 2011 base year. Rescaling the time series is a simple calculation, where we divide each year by the value of the year we wish to rescale the constant LCU time series (e.g., divide each year in the LCU 2010 constant values by the 2011 value in 2010 prices). Then, we multiply this ratio by the current value of the year we wish to rescale the time series (e.g., the 2011 value in 2011 prices).
+
+Here we provide the steps for the conversion. Please refer to the raw knitr (Rnw) file to see the underlying code.
+
+\begin{enumerate}
+\item Read in the World Bank constant LCU in 2011 values.
+Downloaded on Oct 7, 2018:\\https://data.worldbank.org/indicator/NY.GDP.PCAP.KN
+
+<<echo=F>>=
+df_const <- read.csv('../data/Constant_GDP_LCU/API_NY.GDP.PCAP.KN_DS2_en_csv_v2_10134452/API_NY.GDP.PCAP.KN_DS2_en_csv_v2_10134452.csv', stringsAsFactors = F, skip = 4)
+# Select country and years 2003-2017 to reduce data
+df_const <- df_const[, c(1, (ncol(df_const) - 15):(ncol(df_const) - 1))]
+@
+
+\item Create lookup table, where each country's GDP per capita is relative to the 2011 base year (i.e., 2011 will equal 1 for all countries).
+
+<<echo=F>>=
+countries <- df_const$Country.Name
+constant_LCU_2011 <- df_const$X2011
+df_const  <- data.frame(lapply(df_const[, 2:length(df_const)], 
+                               FUN = function(x) x / df_const$X2011))
+df_const$country <- countries
+df_const <- melt(df_const, 
+                 id.vars = c('country'), 
+                 variable.name = 'year',
+                 value.name = 'gdp_convert_ratio_to_2011')
+df_const$year <- sub('X', '', df_const$year)
+df_const$year <- as.numeric(df_const$year)
+df_const$constant_LCU_2011 <- df_const$gdp_convert_ratio_to_2011 * 
+  constant_LCU_2011
+@
+
+\item Read in the World Bank current LCU.
+Downloaded on Oct 9, 2018:\\https://data.worldbank.org/indicator/NY.GDP.PCAP.CN
+
+<<echo=F>>=
+df_current <- read.csv('../data/Current_GDP_LCU/API_NY.GDP.PCAP.CN_DS2_en_csv_v2_10134355/API_NY.GDP.PCAP.CN_DS2_en_csv_v2_10134355.csv', stringsAsFactors = F, skip = 4)
+# Select country and years 2003-2017 to reduce data
+df_current <- df_current[, c(1, (ncol(df_current) - 15):(ncol(df_current) - 1))]
+colnames(df_current)[1] <- 'country'
+df_current_2011 <- data.frame(country = df_current$country, 
+                              current_LCU_2011 = df_current$X2011)
+df_current <- melt(df_current, 
+                   id.vars = c('country'), 
+                   variable.name = 'year',
+                   value.name = 'current_LCU')
+df_current$year <- sub('X', '', df_current$year)
+df_current$year <- as.numeric(df_current$year)
+
+df_current <- merge(df_current, df_current_2011, by = 'country', all.x = T)
+@
+
+\item Merge the constant LCU and current LCU datasets.
+
+<<echo=F>>=
+tmp <- merge(df_const, df_current, by = c('country', 'year'))
+@
+
+\item Multiply each ratio by the GDP per capita of each country's LCU current 2011 value. (Rescale 2010 constant time series to 2011 as a base year.)
+
+<<echo=F>>=
+tmp$constant_LCU_2011 <- tmp$gdp_convert_ratio_to_2011 * tmp$current_LCU_2011
+@
+
+\item For a sanity check, the World Bank provides the United States (US) GDP per capita PPP in 2011 dollars. Since there is no conversion needed for the US from actual GDP to GDP PPP, our time series' values for the US should be identical. The World Bank reports that the 2017 GDP per capita PPP in 2011 for the US was \$54,225. Our value for the US in 2017 is also:
+
+<<echo=F>>=
+print(tmp[which(tmp$country == 'United States' & 
+                tmp$year == 2017), ]$constant_LCU_2011)
+@
+
+\item To apply this value to a country's current GDP, we would divide the GDP in the constant year by the GDP in the current year (e.g., ratio = 2017 value in 2011 prices / 2017 value in 2017 prices). We can multiply this conversion ratio by RuLIS's income and expenditure data in a current year to convert the current value to a constant value (e.g., ratio * a household's 2017 income in 2017 values).
+
+<<echo=F>>=
+tmp$LCU_ratio <- tmp$constant_LCU_2011 / tmp$current_LCU
+tmp <- tmp[, c('country', 'year', 'LCU_ratio')]
+@
+
+\item Finally, to convert the constant incomes in 2011 base year to their PPP equivalents, we can use the World Bank's PPP conversion table for the 2011 year. Read in World Bank GDP per capita, PPP conversion table (LCU per international \$). Downloaded on Oct 7, 2018:\\https://data.worldbank.org/indicator/PA.NUS.PPP
+
+<<echo=F>>=
+df_ppp <- read.csv('../data/PPP_LCU_Conversion/API_PA.NUS.PPP_DS2_en_csv_v2_10134969/API_PA.NUS.PPP_DS2_en_csv_v2_10134969.csv', skip = 4, stringsAsFactors = F)
+
+df_ppp <- df_ppp[, c('Country.Name', 'X2011')]
+colnames(df_ppp) <- c('country', 'ppp_conversion_2011')
+@
+
+\item We merge the PPP conversion ratios for 2011 with the dataset that contains the conversion ratios of current to constant LCU in 2011 base year. Since the PPP conversion ratios convert each LCU to USD, the US conversion ratio is 1.
+
+<<echo=F>>=
+df_convert <- merge(tmp, df_ppp, by = c('country'))
+@
+
+\item To make sure our conversion works, we test this conversion on Vietnam.
+According to the World Bank data, in 2017, Vietnam has a per capita GDP (constant 2011 PPP) of \$6,172. 
+
+\item Read in World Bank per capita GDP (2011 PPP values) data.
+Downloaded on Oct 7, 2018:\\https://data.worldbank.org/indicator/NY.GDP.PCAP.PP.KD
+
+<<echo=F>>=
+df_const_2011_ppp <- read.csv('../data/PPP_Constant_2011_GDP/API_NY.GDP.PCAP.PP.KD_DS2_en_csv_v2_10144534/API_NY.GDP.PCAP.PP.KD_DS2_en_csv_v2_10144534.csv', skip = 4, stringsAsFactors = F)
+# Select country and years 2003-2017 to reduce data
+df_const_2011_ppp <- df_const_2011_ppp[, c(1, (ncol(df_const_2011_ppp) - 15):(ncol(df_const_2011_ppp) - 1))]
+colnames(df_const_2011_ppp)[1] <- 'country'
+df_const_2011_ppp <- melt(df_const_2011_ppp,
+                          id.vars = c('country'), 
+                          variable.name = 'year',
+                          value.name = 'wb_gdp_2011_ppp')
+
+df_const_2011_ppp$year <- sub('X', '', df_const_2011_ppp$year)
+df_const_2011_ppp$year <- as.numeric(df_const_2011_ppp$year)
+# print(round(df_const_2011_ppp[which(df_const_2011_ppp$country == 'Vietnam' &
+#                                     df_const_2011_ppp$year == 2017), ]$wb_gdp_2011_ppp, 0))
+@
+
+\item For the same year, Vietnam has a current per capita GDP of 52,415,900 Dong. When we multiply Vietnam's current 2017 per capita GDP by our conversion ratio, which converts the GDP to the base year of 2011. Then we divide the 2017 GDP in 2011 constant values by the 2011 PPP conversion. We checked and got the same value as World Bank listed (see raw code below to check).
+
+<<echo=F>>=
+# ratios <- df_convert[which(df_convert$country == 'Vietnam' & df_convert$year == 2017), ]
+# print(round(ratios$LCU_ratio * 
+#             df_const_2011_ppp[which(df_const_2011_ppp$country == 'Vietnam' &
+#                                     df_const_2011_ppp$year == 2017),]$wb_gdp_2011_ppp /
+#             ratios$ppp_conversion_2011, 0))
+@
+
+\item From this example, we can simplify our conversion factor into one term (LCU ratio / PPP conversion for 2011). This conversion factor can be multiplied by the income and expenditure variables in RuLIS to get the constant values in 2011 terms. Here we compute this conversion factor and merge it with the RuLIS dataset.
+
+<<echo=F>>=
+df_convert$ratio_PPP2011 <- df_convert$LCU_ratio / 
+  df_convert$ppp_conversion_2011
+df_convert <- df_convert[, c('country', 'year', 'ratio_PPP2011')]
+@
+
+\item We merge the conversion ratio with the RuLIS dataset (in this step, we also merge the World Bank GDP per capita in 2011 PPP values for later comparison).
+
+<<echo=F>>=
+# Clean up country names for matching
+df_hh$country <- ifelse(df_hh$country == 'BurkinaFaso', 'Burkina Faso',
+                 ifelse(df_hh$country == 'CotedIvoire', "Cote d'Ivoire",
+                 ifelse(df_hh$country == 'SierraLeone', 'Sierra Leone',
+                 ifelse(df_hh$country == 'TimorLeste', 'Timor-Leste', 
+                        df_hh$country))))
+# Merge
+df_hh <- merge(df_hh, df_convert, 
+               by = c('country', 'year'), 
+               all.x = T, all.y = F)
+df_hh <- merge(df_hh, df_const_2011_ppp, 
+               by = c('country', 'year'), 
+               all.x = T, all.y = F)
+@
+
+\item Finally, we apply the conversion factor to the variables of interest in RuLIS.
+
+<<echo=F>>=
+# convert monetary values to 2011 ppp
+df_hh$value_ppp2011 <- ifelse(df_hh$variable %in% 
+                                unlist(variable_lists[3:9], use.names = F),
+                              df_hh$value * df_hh$ratio_PPP2011,
+                              df_hh$value)
+@
+
+\item We create two columns to adjust the constant-dollar values: per capita per day and per ha. For per capita per day, we use household size. 
+
+<<echo=F>>=
+# convert monetary values to 2011 ppp per capita per day
+df_hh$value_ppp2011_pc <- ifelse(df_hh$variable %in% 
+                                   unlist(variable_lists[3:9], 
+                                          use.names = F),
+                                df_hh$value * df_hh$ratio_PPP2011 / 
+                                  df_hh$hhsize / 365,
+                                df_hh$value)
+
+# convert monetary values to 2011 ppp per ha
+df_hh$value_ppp2011_ha <- ifelse(df_hh$landown > 0,
+                          ifelse(df_hh$variable %in% 
+                                   unlist(variable_lists[3:9], 
+                                          use.names = F),
+                                 df_hh$value * df_hh$ratio_PPP2011 / 
+                                   df_hh$landown,
+                                 df_hh$value), NA)
+@
+
+\end{enumerate}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Identify Key Variables}
+
+\subsubsection{Defining Farm Size}
+
+RuLIS has 34 farm size related variables ranging from ownership to operated land to cultivated land. Operated land would be the optimal variable since it represents owned and rented land, pasture and cropland, and any water bodies or forest areas that are under cultivation. However, operated land is only available for 24 countries and is not available for India, which is a key smallholder country. Here we test the relationships between all the farm size variables to determine which definition of farm size is most similar to operated area, while enabling us to keep the most data and greatest number of countries.
+
+<<echo=F>>=
+farm_area_vs <- c(
+ 'agricultural_land',
+ 'arable_land',
+ 'arable_land_own',
+ 'crop_land',
+ 'cultivated',
+ 'dland_cul',
+ 'farm_area',
+ 'fem_arable_land_own',
+ 'fem_landown',
+ 'for_land',
+ 'itotlandcul',
+ 'joint_arable_land_own',
+ 'joint_landown',
+ 'landown',
+ 'landowntitle',
+ 'm_fem_temp_crops',
+ 'm_male_temp_crops',
+ 'male_arable_land_own',
+ 'male_landown',
+ 'oth_land',
+ 'perm_crops',
+ 'perm_meadows',
+ 'rtotlandcul',
+ 'temp_crops',
+ 'temp_fallow')
+
+tmp <- df %>% select(id, country, farm_area_vs)
+tmp$farm_size_merged <- ifelse(!is.na(tmp$crop_land),
+                         tmp$crop_land,
+                         tmp$cultivated)
+tmp <- melt(tmp, id.vars = c('id', 'country', 'farm_area'))
+tmp <- tmp[which(tmp$value >= 0),]
+tmp <- tmp %>% group_by(variable) %>%
+ mutate(c = length(unique(country)),
+        v = paste0(variable, '\n', c, ' Countries'),
+        region = country) %>%
+ arrange(c)
+@
+
+Here is the relationship between operated area and each of the farm area variables.
+
+<<fig.cap='The relationship between operated area and each of the farm area variables. Landown has the closest fit and contains more countries.', fig.height=6.5, size='footnotesize', echo=F>>=
+ggplot(tmp,
+      aes(x = log(value),
+          y = log(farm_area))) +
+   # geom_smooth(method = 'lm') +
+   geom_smooth(aes(color = 'Smoothed Fit')) +
+   geom_abline(aes(slope = 1,
+                   intercept = 0,
+                   color = '1-1 Line')) +
+ theme(strip.text = element_text(size = 6)) +
+ facet_wrap(~ v)
+@
+
+Here are the spatial distribution of all the farm area variables.
+
+<<fig.cap='The spatial distribution of all the farm area variables', fig.height=6.5, size='footnotesize', echo=F>>=
+tmp2 <- df %>% select(id, country, c(farm_area_vs, dsmall))
+tmp2$farm_size_merged <- ifelse(!is.na(tmp2$crop_land),
+                         tmp2$crop_land,
+                         tmp2$cultivated)
+tmp2 <- melt(tmp2, id.vars = c('id', 'country'))
+tmp2 <- tmp2[which(tmp2$value >= 0),]
+tmp2 <- tmp2 %>%
+  group_by(variable) %>%
+  mutate(c = length(unique(country)),
+         v = paste0(variable, '\n', c, ' Countries'),
+         region = country) %>%
+  arrange(c)
+
+tmp2 <- tmp2 %>%
+ mutate(region = country) %>%
+ group_by(variable, v, region) %>%
+ summarise(n = length(unique(region)),
+           c = max(c, na.rm = T))
+
+
+require(rworldmap)
+map_world <- map_data('world')
+map_world <- subset(map_world, region != 'Antarctica')
+map_world$region <- ifelse(map_world$region == 'Ivory Coast',
+                          'CotedIvoire',
+                          map_world$region)
+
+map_world$region <- ifelse(map_world$region == 'Burkina Faso',
+                          'Burkina Faso',
+                          map_world$region)
+
+map_world$region <- ifelse(map_world$region == 'Timor-Leste',
+                          'Timor-Leste',
+                          map_world$region)
+
+map_world2 <- full_join(map_world, tmp2, by = 'region')
+map_world2$n <- ifelse(map_world2$n > 0, '1', '0')
+map_world2 <- map_world2[which(!is.na(map_world2$v)), ]
+
+ggplot() +
+   geom_polygon(data = map_world,
+             aes(x = long,
+                 y = lat,
+                 fill = 'No Data',
+                 group = group)) +
+   geom_polygon(data = map_world2,
+             aes(x = long,
+                 y = lat,
+                 fill = 'Data',
+                 group = group),
+                color = 'white',
+                size  = .1) +
+   scale_fill_manual(values = c('No Data' = 'grey90',
+                                'Data' = '#D361FF'),
+                     name = '') +
+   labs(title = '') +
+   theme_void() +
+   theme(strip.text = element_text(size = 6)) +
+   # theme(legend.position = c(0.1,.4),
+   #       legend.key.width = unit(.15, 'cm')) +
+   coord_fixed() +
+   coord_proj('+proj=robin +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs') +
+ facet_wrap(~ v, ncol = 6)
+
+# ggsave('RuLIS_farmSize_compare.png', dpi = 300)
+@
+
+We define farm size using similar area related variables as in the RuLIS binary definition of smallholder. The spatial size variable are not always consistent across countries, so the farm area variables are used as available in hierarchical order: crop land area, cultivated area, farm area, and TLU unit (in ha)). This definition was applied to the previous section when we divided the value by farm area. We further detail our farm size variable here.
+
+<<fig.cap='Map of which variable to measure farm size was used per country.', out.width = '.95\\textwidth', size='footnotesize',fig.height=4, echo=F>>=
+tmp <- df_hh
+
+tmp$farm_size <- ifelse(!is.na(tmp$crop_land) & tmp$crop_land > 0., 'crop_land',
+                 ifelse(!is.na(tmp$cultivated) & tmp$cultivated > 0., 'cultivated',
+                 ifelse(!is.na(tmp$farm_area) & tmp$farm_area > 0., 'farm_area',
+                 ifelse(!is.na(tmp$TLU_total) & tmp$TLU_total > 0., 'TLU_total', NA))))
+
+tmp <- tmp %>%
+  mutate(region = country) %>%
+  select(region, farm_size) %>%
+  na.omit() %>%
+  group_by(region) %>%
+  mutate(n_tot = n()) %>%
+  group_by(region, farm_size) %>%
+  summarise(p = 100 * n() / max(n_tot, na.rm = T)) %>%
+  filter(p == max(p, na.rm = T)) %>%
+  ungroup()
+
+map_world <- map_data('world')
+map_world <- subset(map_world, region != 'Antarctica')
+map_world$region <- ifelse(map_world$region == 'Ivory Coast',
+                           'CotedIvoire',
+                           map_world$region)
+
+map_world$region <- ifelse(map_world$region == 'Burkina Faso',
+                           'Burkina Faso',
+                           map_world$region)
+
+map_world$region <- ifelse(map_world$region == 'Timor-Leste',
+                           'Timor-Leste',
+                           map_world$region)
+
+map_world2 <- full_join(map_world, tmp, by = 'region')
+map_world2$farm_size <- ifelse(map_world2$farm_size == 'crop_land',
+                               'Cropland',
+                        ifelse(map_world2$farm_size == 'cultivated',
+                               'Cultivated',
+                        ifelse(map_world2$farm_size == 'farm_area',
+                               'Farm Area',
+                        ifelse(map_world2$farm_size == 'TLU_total',
+                               'TLU Unit (ha)',
+                               NA))))
+map_world2 <- map_world2[which(!is.na(map_world2$farm_size)),]
+
+levels <- c('Cropland', 'Cultivated', 'Farm Area', 'TLU Unit (ha)')
+colors <- c('#1b9e77','#d95f02','#7570b3','#e7298a')
+
+map_world2$farm_size <- ordered(map_world2$farm_size, 
+                                levels = levels)
+ggplot() +
+      geom_polygon(data = map_world,
+              aes(x = long,
+                  y = lat,
+                  group = group),
+               color = 'white',
+               fill = 'grey90',    
+               size  = .1) +
+    geom_polygon(data = map_world2,
+              aes(x = long,
+                  y = lat,
+                  fill = farm_size,
+                  group = group),
+                 color = 'white',
+                 size  = .1,
+                 alpha = .8) +
+    labs(title = '') +
+    guides(fill = guide_legend(title = 'Predominant\nVariable Used')) +
+    theme_void() +
+    theme(legend.text = element_text(size = 8),
+          legend.title = element_text(size = 9)) +
+    # theme(legend.position = c(0.1,.4),
+    #       legend.key.width = unit(.15, 'cm')) +
+    coord_fixed() +
+    coord_proj('+proj=robin +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs')
+@
+
+Here, we subset the data to only include observations that have a 'farm size' value.
+In order to only examine farming households and ensure that our per ha calculation does not generate infinities, we subset the data by landown area (rented or owned) as over zero ha and use the grouping variable 'ag\_part' is 1 to ensure only agricultural households are in the data.
+
+<<echo=F>>=
+# df_hh <- df_hh[which(df_hh$landown > 0), ]
+df_hh <- df_hh[which(df_hh$landown > 0 & df_hh$ag_part == 1), ]
+n_hh <- length(unique(df_hh$id))
+n_con <- length(unique(df_hh$country))
+n_ind <- df_hh %>% 
+  group_by(id) %>% 
+  summarise(h = max(hhsize, na.rm = T)) %>%
+  ungroup() %>%
+  summarise(n = sum(h, na.rm = T))
+n_ind <- n_ind[[1]]
+
+# This dataset contains \Sexpr{n_hh} households and \Sexpr{n_ind} individuals from \Sexpr{n_con}.
+@
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Farmer Classifications}
+
+Here, we construct additional variables to farm size that also represent various dimensions of possibly vulnerable farmers.
+
+\begin{enumerate}
+  \item Family farm (percent family labor compared to all labor would be ideal, but data is not available for many countries. Instead, we used inverse of the labor expenditure to total household expenditure; see below for how this relates to days of family labor / days of total labor).
+  \item Subsistence (percent food consumed to value of crop produced)
+  \item Female headed/high female ratio (HH female labor ratio)
+  \item Rainfed level (percent of land rainfed)
+  \item Economic size (in the RuLIS proposed definition of smallholder, they use a combination of country relative farm size and economic size. We use their definition of economic size as a ranked percentage of crop revenue).
+  \item We create a country relative farm size variable using the same method as economic size above.
+\end{enumerate}
+
+Note: We include livestock producers in our income variables.
+Note: Please refer to the manuscript for the finalized definitions for each variable.
+
+
+<<echo=F>>=
+# reshape data
+# since df_hh was long form, take first id entry to not duplicate data
+tmp1 <- df_hh %>% select(variable.names(df_hh)[c(1:21)])
+tmp1 <- tmp1[!duplicated(tmp1$id),] 
+
+# cast df_hh variable and pc value to wide form
+tmp2 <- dcast(df_hh, id ~ variable, value.var = 'value_ppp2011_pc')
+
+# merge value_pc back with main dataframe
+df_pc <- merge(tmp1, tmp2, by = 'id')
+tmp1 <- NULL
+tmp2 <- NULL
+@
+
+Here is the R code used in constructing farmer variables.
+
+<<>>=
+df_pc$p_famdays   <- df_pc$famdays / df_pc$labtot        # percent fam labor
+df_pc$p_famLab    <- 1 - (df_pc$laborexp / df_pc$hhexp)  # percent of exp on labor
+df_pc$p_subsist   <- df_pc$cropown / df_pc$cropvp        # percent subsistence
+df_pc$p_femLab    <- df_pc$flaborshare                   # percent fem labor
+df_pc$p_rain      <- df_pc$rtotlandcul / df_pc$landown   # percent rainfed
+@
+
+<<echo=F>>=
+f_types <- c('landown', 'rel_landown',
+             'p_famLab', 'p_subsist', 
+             'p_femLab', 'p_rain', 'dsmall', 'rel_econsize') 
+
+f_types_names <- data.frame(
+  f_types = f_types,
+  f_types_names = c(
+    'Farm Size (ha)', 
+    'Farm Size (rel)',
+    'Family Labor (%)', 
+    'Subsistence (%)', 
+    'Female Labor (%)',  
+    'Rainfed (%)',
+    'SDG 2.3 Smallholder',
+    'Economic Size (%)'))
+
+df_pc <- df_pc[, c('id', 'country', 'region', 'landown', 
+                   'p_famLab', 'p_subsist', 'p_femLab', 
+                   'p_rain', 'dsmall', 'p_famdays')]
+
+# Old way to caluclate bottom 40%; 
+# see new way below for consistency with RuLIS dsmall
+# df_pc <- df_pc %>%
+#   group_by(country) %>%
+#   arrange(landown, .by_group = T) %>%
+#   mutate(rank_landown = ifelse(!is.na(landown), 1:n(), NA),
+#          rel_landown = rank_landown / max(rank_landown, na.rm = T)) %>%
+#   ungroup()
+@
+
+<<>>=
+# Relative farm size per country
+df_pc <- df_pc %>%
+  filter(landown > .25) %>% # see outlier section below for cutoff validation
+  group_by(country) %>%
+  arrange(landown, .by_group = T) %>%
+  mutate(rank_landown = 
+           cumsum(ifelse(is.na(landown), 0, landown)) + landown*0,
+         bot40_farm = max(rank_landown, na.rm = T) * .4,
+         rel_landown = rank_landown / max(rank_landown, na.rm = T)) %>% 
+  arrange(rank_landown, .by_group = T) %>%
+  ungroup()
+
+# Relative economic size per country
+tmp <- df[,c('id', 'cropvp')]
+colnames(tmp)[2] <- 'rel_econsize'
+df_pc <- merge(df_pc, tmp, by = 'id', all.x = T, all.y = F)
+
+df_pc <- df_pc %>%
+  filter(landown > .25) %>% # see outlier section below for cutoff validation
+  group_by(country) %>%
+  arrange(rel_econsize, .by_group = T) %>%
+  mutate(rank_econsize = 
+           cumsum(ifelse(is.na(rel_econsize), 0, rel_econsize)) + rel_econsize*0,
+         bot40_econ = max(rank_econsize, na.rm = T) * .4,
+         rel_econsize = rank_econsize / max(rank_econsize, na.rm = T)) %>% 
+  arrange(rank_landown, .by_group = T) %>%
+  ungroup()
+@
+
+Since we define percent family labor as the inverse of the labor expenditure to total household expenditure relationship, we test this definition against a subset of 10 countries that contain number of family labor days compared to total labor days. (Note, there is one value that has the labor expenditure over the total household expenditure, so we omit this entry.)
+
+<<fig.cap='The percent family labor in terms of days worked was not available for all countries, but the percent labor expenditure of the total farm expenditure was available. We use percent labor expenditure (x-axis) as a proxy for percent famly labor days (y-axis) since there was a consistent relationship between the variables in countries with both variables available.', fig.height=4, size='footnotesize', echo=F>>=
+df_pc$p_famLab <- ifelse(df_pc$p_famLab < 0, NA, df_pc$p_famLab)
+
+tmp <- df_pc
+tmp <- tmp %>% 
+  select(country, p_famdays, p_famLab) %>% 
+  ungroup() %>% 
+  na.omit()
+
+p1 <- ggplot(tmp, aes(p_famLab, p_famdays)) + 
+  # geom_point(size = .1, color = 'grey90') +
+  geom_smooth(aes(color = country),
+              method = 'lm',
+              se = F, 
+              size = 0.2,
+              fullrange = F) +
+  geom_smooth(color = 'black',
+              method = 'lm',
+              fullrange = F) +
+  xlab('Percent Family Labor Expenditures') +
+  ylab('Percent Family Labor Hours') +
+  labs(color = '')
+p1
+df_pc$p_famdays <- NULL
+@
+
+The percent subsistence variable show scores over 1 (100\%) in certain cases; similarly, the percent rainfed plus percent irrigated shows values over 1 in certain cases. Here we examine the data and set the over 1 values as null, as they should be impossible with accurate data.
+
+<<fig.cap='The percent subsistence variable show scores over 1 (100 percent) in certain cases; similar the percent rainfed plus percent irrigated shows values over 1 in certain cases. We look at the anomolous data per country.', fig.height=3, size='footnotesize', echo=F>>=
+#FLAG
+p <- function(x = 'x', y = 'y', dat = df) {
+    
+  dat$x <- dat[[x]]
+  dat$y <- dat[[y]]
+  
+  v <- c('country', 'foodexp', 'hhexp',
+         'agrincome', 'cropvp', 'cropown',
+         'rtotlandcul', 'itotlandcul', 'landown', x, y)
+  
+  dat$id_tmp <- dat$id
+  
+  t <- dat %>% 
+    group_by(country) %>% 
+    mutate(tot = n_distinct(id_tmp)) %>% 
+    filter(x > y) %>% 
+    select(v, tot, id_tmp) %>% 
+    summarise(n = n_distinct(id_tmp), p = 100 * n / max(tot)) %>% 
+    arrange(p)
+
+  t2 <- dat[which(dat$x > dat$y), ]
+  p_t <- length(unique(t2$id)) / length(unique(dat$id))
+
+  p1 <- ggplot(t, aes(reorder(country, p), p)) +
+    geom_bar(stat = 'identity') + coord_flip() +
+    theme(axis.text = element_text(size = 6),
+          text = element_text(size = 8),
+          plot.title = element_text(size = 10)) +
+    xlab('') +
+    ylab(paste0('Percent obs where ', x, ' > ', y)) +
+    ggtitle(paste0(round(100 * p_t, 2), 
+                   ' percent of households\ncontains ', 
+                   x, ' > ', y))
+
+  return(p1)
+}
+
+df$rainfed_and_irrigated <- df$rtotlandcul + df$itotlandcul
+plot_grid(p('cropown', 'cropvp'),
+          p('rainfed_and_irrigated', 'farm_area'),
+          # p('itotlandcul', 'farm_area'),
+          ncol = 2)
+@
+
+<<echo=F>>=
+df_pc$p_subsist <- ifelse(df_pc$p_subsist > 1, NA, df_pc$p_subsist)
+df_pc$p_rain <- ifelse(df_pc$p_rain > 1, NA, df_pc$p_rain)
+@
+
+Each dimension of smallholders/types of farmers have data available for a varying number of countries, as shown in the below panel plot.
+
+<<fig.cap='Country level avaialbility of each dimension of smallholder.', fig.height=5, size='footnotesize', echo=F>>=
+df_pc$rank_landown <- NULL
+df_pc$hhid <- NULL
+df_pc$com_id <- NULL
+
+# Not all countries have region codes. add dummy so not omitted
+df_pc$region <- ifelse(!is.na(df_pc$region), df_pc$region, 1)
+df_pc <- melt(df_pc,
+              id.vars = c('id', 'country', 'region'))
+
+df_pc <- na.omit(df_pc)
+
+tmp <- df_pc %>%
+  group_by(country, variable) %>%
+  summarize(n = n()) %>%
+  mutate(region = country,
+         p = '1')
+
+tmp <- merge(tmp, f_types_names, 
+             by.x = 'variable', 
+             by.y = 'f_types', 
+             all.x = T)
+
+tmp <- tmp %>% 
+  na.omit() %>%
+  group_by(f_types_names) %>%
+  mutate(n_co = length(unique(region)),
+         title = paste0(f_types_names, '\n', n_co, ' Countries'))
+
+map_world2 <- full_join(map_world, tmp, by = 'region')
+map_world2$p <- ifelse(map_world2$p == '1' , map_world2$p, 0)
+map_world2 <- map_world2[which(!is.na(map_world2$variable)), ]
+
+ggplot() +
+    geom_polygon(data = map_world, 
+              aes(x = long, 
+                  y = lat, 
+                  fill = 'No Data',
+                  group = group)) +
+    geom_polygon(data = map_world2,
+              aes(x = long, 
+                  y = lat,
+                  fill = 'Data',
+                  group = group),
+                 color = 'white', 
+                 size  = .1) +
+    scale_fill_manual(values = c('No Data' = 'grey90',
+                                 'Data' = '#D361FF'),
+                      name = '') +
+    labs(title = '') +
+    theme_void() +
+    theme(strip.text = element_text(size = 8)) +
+    # theme(legend.position = c(0.1,.4),
+    #       legend.key.width = unit(.15, 'cm')) +
+    coord_fixed() +
+    coord_proj('+proj=robin +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs') +
+  facet_wrap(~ title, ncol = 3)
+@
+
+<<echo=F>>=
+# Make an easy-to-share dataframe for latter sections to use farmer type.
+df_farmer_type <- df_pc[which(as.character(df_pc$variable) %in% f_types ),]
+df_farmer_type$variable <- as.character(df_farmer_type$variable)
+df_farmer_type$value <- as.numeric(df_farmer_type$value)
+df_farmer_type <- dcast(df_farmer_type, id ~ variable, value.var = 'value')
+@
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\section{Data Anomalies}
+\subsection{Farm Size}
+
+A main issue with the data is when we look at per ha income and expenditure for very small farms. The data seems systematically inflated for farms less than 0.2 5 ha. Here are the relationships for different farm size thresholds between key on farm income variables (per ha) and farm size. We can see that the very small farms show extreme income values per ha.
+
+<<fig.cap='Very small farms show extremely inflated productivity (profit per ha) and expenditure values. This plot tests 3 cutoff points to subset the data over a certain farm size limit.', fig.height=4, size='footnotesize', echo=F>>=
+tmp <- df_hh %>% 
+  select(country, grouping, hhid, variable, landown, 
+         value_ppp2011, value_ppp2011_pc, value_ppp2011_ha) %>%
+  filter(grouping == 'inc_onfarm') %>%
+  group_by(country, hhid, variable) %>%
+  summarise(landown = max(landown), 
+            var1    = max(value_ppp2011_ha))
+
+ggplot() +
+  # geom_smooth(data = tmp,
+  #             aes(x = log(landown),
+  #                 y = (var1),
+  #                 color = 'No cut off'),
+  #             fullrange = F,
+  #             se = F) +
+  geom_smooth(data = tmp %>% filter(landown > .01),
+              aes(x = log(landown),
+                  y = (var1),
+                  color = '.01'),
+              fullrange = F,
+              se = F) +
+  geom_smooth(data = tmp %>% filter(landown > .05),
+              aes(x = log(landown),
+                  y = (var1),
+                  color = '.05'),
+              fullrange = F,
+              se = F) +
+  geom_smooth(data = tmp %>% filter(landown > .25),
+              aes(x = log(landown),
+                  y = (var1),
+                  color = '.25'),
+              fullrange = F,
+              se = F) +
+  xlab('log ( Farm Size (ha) )') +
+  ylab('2011 USD PPP per ha') +
+  labs(color = 'Farm Size\nThreshold (ha)') +
+  scale_color_manual(values = c('blue', 'red', 'green')) +
+  facet_wrap(~ variable,
+             scales = 'free') +
+  theme(axis.text = element_text(size = 7))
+@
+
+
+<<echo=F>>=
+cutoff <- 0.25
+
+tmp1 <- df_hh[which(df_hh$landown > 0), ]
+tmp <- df_hh[which(df_hh$landown > cutoff), ]
+o <- round(100 * (length(unique(tmp$hhid)) - 
+                    length(unique(tmp1$hhid))) / 
+                  length(unique(df_hh$hhid)), 2)
+tmp1 <- tmp <- NULL
+
+df_hh <- df_hh[which(df_hh$landown > cutoff),]
+df_farmer_type <- df_farmer_type[which(df_farmer_type$landown > cutoff),]
+@
+
+We set the data to only examine farms > \Sexpr{cutoff} ha to avoid potential inflated reporting from very very small farms, while still including \Sexpr{100 - abs(o)}\% of all households.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Income and Revenue}
+
+A second key issue in the data is where crop income was reported greater than crop revenue. Here we examine where crop income > crop revenue and set these cases to NA, as they should be impossible with accurate data. We repeat this for livestock, forestry, and fishery data.
+
+<<echo=F>>=
+tmp <- df_hh %>% select(country, id, variable, value_ppp2011)
+tmp <- dcast(tmp, country + id ~ variable, value.var = 'value_ppp2011')
+tmp <- tmp[which(tmp$crop > tmp$cropvp),]
+
+lambda <- function(dat = tmp) {
+
+  df_hh$value <- ifelse(df_hh$id %in% unique(dat$id),
+                        NA,
+                        df_hh$value)
+  df_hh$value_ppp2011 <- ifelse(df_hh$id %in% unique(dat$id),
+                                NA,
+                                df_hh$value_ppp2011)
+  df_hh$value_ppp2011_pc <- ifelse(df_hh$id %in% unique(dat$id),
+                                   NA,
+                                   df_hh$value_ppp2011_pc)
+  df_hh$value_ppp2011_ha <- ifelse(df_hh$id %in% unique(dat$id),
+                                   NA,
+                                   df_hh$value_ppp2011_ha)
+
+  return(df_hh)
+}
+
+df_hh <- lambda(tmp)
+
+tmp <- df_hh %>% select(country, id, variable, value_ppp2011)
+tmp <- dcast(tmp, country + id ~ variable, value.var = 'value_ppp2011')
+tmp <- tmp[which(tmp$livestock > tmp$livstvp),]
+df_hh <- lambda(tmp)
+
+tmp <- df_hh %>% select(country, id, variable, value_ppp2011)
+tmp <- dcast(tmp, country + id ~ variable, value.var = 'value_ppp2011')
+tmp <- tmp[which(tmp$forestry > tmp$forestvp),]
+df_hh <- lambda(tmp)
+
+tmp <- df_hh %>% select(country, id, variable, value_ppp2011)
+tmp <- dcast(tmp, country + id ~ variable, value.var = 'value_ppp2011')
+tmp <- tmp[which(tmp$fishery > tmp$fishvp),]
+df_hh <- lambda(tmp)
+@
+
+Similarly, an issue in the data is where agricultural income was reported greater than total income. Here we examine where agricultural income > total income and set these cases to NA, as they should be impossible with accurate data.
+
+<<echo=F>>=
+tmp <- df_hh %>% select(country, id, variable, value_ppp2011)
+tmp <- dcast(tmp, country + id ~ variable, value.var = 'value_ppp2011')
+tmp <- tmp[which(tmp$agrincome > tmp$totincome),]
+df_hh <- lambda(tmp)
+@
+
+
+<<fig.cap='Country level data anomalies for profit and revenue variables.', fig.height=6, size='footnotesize', echo=F>>=
+plot_grid(
+  p('crop', 'cropvp'),
+  p('livestock', 'livstvp'),
+  p('fishery', 'fishvp'),
+  p('forestry', 'forestvp'),
+  p('agrincome', 'totincome'),
+  ncol = 3
+)
+@
+
+There are also a decent amount of negative and zero profit values (revenue - expenses), which may be true where farms are running negative profits, but there could also be an issue where there is erroneous revenue and expense reporting that then amplifies the profit errors. 
+
+Here is the percent of observations under 0 per profit variable.
+
+<<echo=F>>=
+# tmp <- df[, c('id', 
+#               'landown', 
+#               'dsmall',
+#               'country',
+#               'totincome',
+#               'agrincome',
+#               'crop',
+#               'livestock')]
+
+tmp <- df_hh
+tmp <- dcast(tmp, id + country + landown+ dsmall ~ 
+               variable, value.var = 'value')
+tmp <- tmp[, c('id', 
+              'landown', 
+              'dsmall',
+              'country',
+              'totincome',
+              'agrincome',
+              'crop',
+              'livestock')]
+
+# In our later analysis, we define ag income
+# by crop + livestock income; see analysis section for rationale
+tmp$onfarm <- tmp$crop + tmp$livestock
+colnames(tmp)[5:8] <- c('Total', 'On-Farm', 'Crop', 'Livestock')
+tmp$onfarm <- NULL
+
+tmp <- melt(tmp, id.vars = c('id', 'country', 'landown', 'dsmall'), 
+            variable.name = 'Income')
+tmp <- na.omit(tmp)
+
+t <- tmp %>%
+  group_by(Income) %>%
+  mutate(n_tot = n()) %>%
+  filter(value < 0) %>%
+  summarise(`Percent < 0` = 100 * n() / max(n_tot)) %>%
+  arrange(desc(`Percent < 0`))
+
+options(xtable.sanitize.text.function = identity)
+print(xtable(t, align = 'llc'),
+      include.rownames = F, size = '\\fontsize{6pt}{7pt}\\selectfont')
+@
+
+We look across countries to see if these errors are systematic. Cote d'Ivore seems to report far more negative related profits than other countries. We omit Cote d'Ivoire because there appears to be a systematic error. 
+
+<<echo=F>>=
+combo <- function(x) sub('[^_]*_','', x )
+
+tmp %>%
+  group_by(Income, country) %>%
+  mutate(n_tot = n()) %>%
+  filter(value < 0) %>%
+  summarise(n = 100 * n() / max(n_tot)) %>%
+  arrange(desc(n)) %>%
+  ungroup() %>%
+  mutate(v = ordered(paste0(Income, '_', country))) %>%
+  ggplot(aes(reorder(v, n), n)) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  xlab('') +
+  ylab('Percent Income < 0') +
+  scale_x_discrete(labels = combo) +
+  theme(axis.text = element_text(size = 7),
+        axis.text.y = element_text(hjust = 0)) +
+  facet_wrap(~ Income, scales = 'free_y')
+
+df_hh <- df_hh[which(df_hh$country != "Cote d'Ivoire"),]
+tmp <- tmp[which(tmp$country != "Cote d'Ivoire"),]
+@
+
+There were a very large proportion of livestock and crop profit values equal to zero, but not for on-farm income and total income. Here is the percent of observations equal to 0 per profit variable.
+
+<<echo=F>>=
+t <- tmp %>%
+  group_by(Income) %>%
+  mutate(n_tot = n()) %>%
+  filter(value == 0) %>%
+  summarise(`Percent == 0` = 100 * n() / max(n_tot)) %>%
+  arrange(desc(`Percent == 0`))
+
+
+options(xtable.sanitize.text.function = identity)
+print(xtable(t, align = 'llc'),
+      include.rownames = F, size = '\\fontsize{6pt}{7pt}\\selectfont')
+@
+
+We look across countries to see if these errors are systematic. Mongolia reports over 90\% crop profit as 0. We omit Mongolia as it seems to be a systematic error.
+
+<<fig.cap='Country level percentages of observations equal to 0 per profit variable.', fig.height=3.5, size='footnotesize', echo=F>>=
+tmp %>%
+  group_by(Income, country) %>%
+  mutate(n_tot = n()) %>%
+  filter(value == 0) %>%
+  summarise(n = 100 * n() / max(n_tot)) %>%
+  arrange(desc(n)) %>%
+  ungroup() %>%
+  mutate(v = ordered(paste0(Income, '_', country))) %>%
+  ggplot(aes(reorder(v, n), n)) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  xlab('') +
+  ylab('Percent Income <= 0') +
+  scale_x_discrete(labels = combo) +
+  theme(axis.text = element_text(size = 7),
+        axis.text.y = element_text(hjust = 0)) +
+  facet_wrap(~ Income, scales = 'free_y')
+
+df_hh <- df_hh[which(df_hh$country != 'Mongolia'),]
+tmp <- tmp[which(tmp$country != 'Mongolia'),]
+@
+
+For now, we keep all values. In our analysis we test how keeping in negative and zero values affects our results.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Outliers}
+
+Another issue is determining which values are outliers when there is not a systematic issue, such as country specific errors, or errors that can be identified through adding other variables together (e.g., in the case of income and revenue above) or thresholding (e.g., farm size thresholds).
+
+We see some very large positive and negative values that are very different than other values in each country for the revenue and expense variables. While presenting the plots here would be too numerous, the summary tables (not calculated per country) show some very large incomes per ha.
+
+<<echo=F>>=
+satargazer_type <- 'latex'
+dat <- df_hh
+dat <- dat[which(dat$variable %in% c('totincome', 'agrincome',
+                                     'crop', 'livestock',
+                                     'cropvp', 'livstvp')),
+           c('id', 'country', 'variable',
+             'value_ppp2011_ha', 'value_ppp2011_pc', 'landown')]
+
+dat_ha <- dcast(dat, id + country + landown ~ variable,
+                value.var = 'value_ppp2011_ha')
+dat_pc <- dcast(dat, id + country + landown ~ variable,
+                value.var = 'value_ppp2011_pc')
+
+stargazer(dat_ha[,4:length(dat_ha)], type = satargazer_type, median = T)
+stargazer(dat_pc[,4:length(dat_pc)], type = satargazer_type, median = T)
+@
+
+
+We deal with outliers (points with high leverage) directly in the analysis through using robust methods that down-weight high leverages (see methods section for details.)
+
+\emph{Note: We tested using the Median Absolute Deviation (MAD) method for outlier imputation/exclusion (as outlined on p70, RuLIS Technical Note) and the interquartile range IQR method for identifying outliers. The MAD method considers observations outliers when their value is lower than 3 x 1.4826 x MADleft or higher than 3 x 1.4826 x MADright away from the median (which is effectively 3 SD); the distance parameter can be adjusted to ensure no greater than 5\% of the data is imputed/removed. Through our testing, the MAD method resulted in certain country/variable pairs to require the distance parameter beyond 100 to trim the data which resulted in heavy skews to a small number of points. Similarly, the IQR method suggests outliers can be defined as quartile 1 (Q1) - 1.5 x IQR and Q3 + 1.5 x IQR, where 1.5 is the distance parameter that can be adjusted. We tested different distance parameters and found that a distance of 5 resulted in crop, total income, and agricultural incomes to remove around 5\% of the data, while livestock required a much higher distance. We found that these two methods drastically changed the results and distributions of the outcome variables. Since the undoctored tails were still reasonable values, especially on the negative side of the distributions that is of most interest in poverty alleviation, we keep all points and deal with high leverages in robust regressions below.}
+
+<<fig.cap='Percent of data removed per capita value due to above outlier definitions.', fig.height=6.5, size='footnotesize', echo=F>>=
+cutoff <- 5
+
+df_hh <-  df_hh %>%
+  group_by(country, variable) %>%
+  mutate(
+        y = value_ppp2011_pc,
+        iqr = IQR(y, na.rm = T),
+        l = summary(y)[2] - iqr * cutoff,
+        h = summary(y)[5] + iqr * cutoff,
+        yorg = length(na.omit(y)),
+        y = ifelse(y > l & y < h, y, NA),
+        p_pc = 1 - length(na.omit(y)) / min(yorg, na.rm = T),
+        value_ppp2011_pc = y,
+
+        y = value_ppp2011_ha,
+        iqr = IQR(y, na.rm = T),
+        l = summary(y)[2] - iqr * cutoff,
+        h = summary(y)[5] + iqr * cutoff,
+        yorg = length(na.omit(y)),
+        y = ifelse(y > l & y < h, y, NA),
+        p_ha = 1 - length(na.omit(y)) / max(yorg, na.rm = T),
+        value_ppp2011_ha = y
+        ) %>%
+  ungroup()
+
+# tmp <-  tmp %>%
+#   filter(variable %in% c('agrincome', 'totincome')) %>%
+#   group_by(country, variable) %>%
+#   mutate(
+#         value_ppp2011_pc = (value_ppp2011_pc + abs(min(value_ppp2011_pc, na.rm = T))),
+#         value_ppp2011_pc = value_ppp2011_pc / max(value_ppp2011_pc, na.rm = T),
+#         value_ppp2011_ha = (value_ppp2011_ha + abs(min(value_ppp2011_ha, na.rm = T))),
+#         value_ppp2011_ha = value_ppp2011_ha / max(value_ppp2011_ha, na.rm = T)
+#         )
+# ggplot(tmp, aes(value_ppp2011_pc)) + geom_density() + facet_wrap(~ variable)
+# 
+
+t <- df_hh %>% group_by(country, variable) %>%
+  summarise(pc = max(p_pc, na.rm = T),
+            ha = max(p_ha, na.rm = T)
+            ) %>%
+  filter(variable %in% c('totincome', 'crop', 'livestock', 'agrincome')) %>%
+  ungroup() %>%
+  mutate(v = ordered(paste0(variable, '_', country)))
+
+ggplot(t, aes(reorder(v, pc), 100 * pc)) +
+    geom_bar(stat = 'identity') +
+    scale_x_discrete(labels = combo) +
+    coord_flip() +
+    facet_wrap(~variable, scales = 'free_y') +
+    theme(axis.text = element_text(size = 7),
+          axis.text.y = element_text(hjust = 0)) +
+  xlab('') +
+  ylab('Percent removed per ha value')
+
+ggplot(t, aes(reorder(v, ha), 100 * ha)) +
+    geom_bar(stat = 'identity') +
+    scale_x_discrete(labels = combo) +
+    coord_flip() +
+    facet_wrap(~variable, scales = 'free_y') +
+    theme(axis.text = element_text(size = 7),
+          axis.text.y = element_text(hjust = 0)) +
+  xlab('') +
+  ylab('Percent removed per capita value')
+@
+
+
+<<echo=F>>=
+## After removing the ouliers, here are our summary statistics for comparison with the summary stat table above (prior to removing outliers).
+# dat <- df_hh
+# dat <- dat[which(dat$variable %in% c('totincome', 'agrincome',
+#                                      'crop', 'livestock',
+#                                      'cropvp', 'livstvp')),
+#            c('id', 'country', 'variable',
+#              'value_ppp2011_ha', 'value_ppp2011_pc', 'landown')]
+# 
+# dat_ha <- dcast(dat, id + country + landown ~ variable,
+#                 value.var = 'value_ppp2011_ha')
+# dat_pc <- dcast(dat, id + country + landown ~ variable,
+#                 value.var = 'value_ppp2011_pc')
+# 
+# stargazer(dat_ha[,4:length(dat_ha)], type = satargazer_type, median = T)
+# stargazer(dat_pc[,4:length(dat_pc)], type = satargazer_type, median = T)
+@
+
+
+
+<<echo=F>>=
+# % The RuLIS documentation suggests using the Median Absolute Deviation (MAD) method for outlier imputation (p70, Techincal Note), which entail:
+# % # 
+# % # \begin{enumerate}
+# % #   \item Observations are considered outliers when their value is lower than 3 x 1.4826 x MADleft or higher than 3 x 1.4826 x MADright away from the median. This choice is equivalent to 3 standard deviations for normally distributed variables, which means that the probability of classifying as outlier a true observation is only 0.27 percent.
+# % #   \item Observations detected as outliers are then replaced with the median value of their subgroup. The share of replaced data should not exceed 5 percent of the total observations. When the percentage is higher, the distance criteria is widened by one 1.4836 x MAD, until the number of outliers is less than 5\% of the data.
+# % #   \item If conducting outlier detection/imputation at a subgroup level, make sure there are at least 100 observations per grouping.
+# % # \end{enumerate}
+# % # 
+# % # 
+# % # <<echo=F>>=
+# % # #tmp code
+# % # id_outliers <- function(dat_, d = 1,
+# % #                         country_variables) {
+# % # 
+# % #   out <- dat_ %>%
+# % #     filter(country_variable %in% country_variables) %>%
+# % #     group_by(variable, country) %>%
+# % #     mutate(median_m = median(value, na.rm = T),
+# % #            median_ll = ifelse(value < median_m, value, NA),
+# % #            median_l = median(median_ll, na.rm = T),
+# % #            mad_left = median_m - abs((median_l * d * 1.4826)),
+# % #            median_hh = ifelse(value > median_m, value, NA),
+# % #            median_h = median(median_hh, na.rm = T),
+# % #            mad_right = median_m + abs(median_h * d * 1.4826),
+# % #            value_dummy = ifelse(value < mad_left, 1,
+# % #                          ifelse(value > mad_right, 1,
+# % #                           0)),
+# % #            value = ifelse(value < mad_left, NA,
+# % #                    ifelse(value > mad_right, NA,
+# % #                           value)),
+# % #             p = 100 * sum(value_dummy, na.rm = T) /
+# % #                 length(!is.na(value)),
+# % #            tracker = ifelse(d > tracker, d, tracker)) %>%
+# % #     select(id, country, variable, country_variable, landown,
+# % #            value, p, tracker) %>%
+# % #     na.omit() %>%
+# % #     ungroup()
+# % # 
+# % #   return(out)
+# % # }
+# % # 
+# % # dat <- df_hh
+# % # dat$value <- dat$value_ppp2011_pc
+# % # variables <- c('totincome', 'agrincome',
+# % #                'crop', 'livestock',
+# % #                'cropvp', 'livstvp')
+# % # 
+# % # dat <- dat[which(dat$variable %in% variables),
+# % #            c('id', 'country', 'variable', 'value', 'landown')]
+# % # dat$country_variable <- paste(dat$country, dat$variable)
+# % # country_variables <- unique(dat$country_variable)
+# % # d <- 5
+# % # dat$tracker <- d
+# % # out <- id_outliers(dat, d, country_variables)
+# % # nrow(out[which(out$variable == 'agrincome'),])
+# % # 
+# % # 
+# % # while (length(country_variables) > 0 & d < 20) {
+# % # 
+# % #   out <- id_outliers(dat, d, country_variables)
+# % # 
+# % #   tmp <- out %>%
+# % #     group_by(country_variable) %>%
+# % #     summarise(p = max(p, na.rm = T)) %>%
+# % #     filter(p > 5)
+# % # 
+# % #   country_variables <- as.character(unique(
+# % #     tmp$country_variable))
+# % # 
+# % #   out_tmp <- out %>%
+# % #         filter(p < 5) %>%
+# % #         na.omit()
+# % # 
+# % #   if (d == 1) {
+# % #     out_final <- out_tmp
+# % #   } else {
+# % #     out_final <- rbind(out_final, out_tmp)
+# % #   }
+# % # 
+# % #   d <- d + 1
+# % #   # print(d)
+# % #   print(length(country_variables))
+# % #   print(nrow(out_final)) / nrow(dat)
+# % # }
+# % # 
+# % # 
+# % # out_final %>%
+# % #   filter(variable %in% c('totincome', 'agrincome')) %>%
+# % #                          # 'crop', 'livestock',
+# % #                          # 'cropvp', 'livstvp')) %>%
+# % #   group_by(variable) %>%
+# % #   mutate(value_log = log(value + abs(min(value, na.rm = T)) + .0001)) %>%
+# % #   ggplot(aes(value_log, color = variable)) +
+# % #     geom_density() +
+# % #     facet_wrap(~ country, scales = 'free')
+# % # 
+# % # out_final <- merge(out_final, df_weights, by = 'id', all.x = T)
+# % # 
+# % # 
+# % # out_final %>%
+# % #   # filter(!country %in% c('Ecuador', 'Mongolia')) %>%
+# % #   filter(variable %in% c('totincome', 'agrincome')) %>%
+# % #                          # 'crop', 'livestock',
+# % #                          # 'cropvp', 'livstvp')) %>%
+# % #   group_by(variable) %>%
+# % #   mutate(value_log = log(value + abs(min(value, na.rm = T)) + .0001)) %>%
+# % #   ggplot(aes(log(landown), value, color = variable)) +
+# % #   # geom_point() +
+# % #   geom_smooth()
+# % #   # facet_wrap(~ country, scales = 'free')
+# % # 
+# % # 
+# % # dat <- df_hh 
+# % # dat$value <- dat$value_ppp2011_pc
+# % # variables <- c('id', 'country', 'variable', 'value', 'landown')
+# % # 
+# % # t <- dat %>%
+# % #   select(variables) %>%
+# % #   filter(variable == 'agrincome') %>%
+# % #   # filter(!country %in% c("Cote d'Ivoire"
+# % #   #                        # 'Nigeria',
+# % #   #                        # 'Ethiopia',
+# % #   #                        # 'Pakistan',
+# % #   #                        # 'Ecuador',
+# % #   #                        # 'Timor-Leste'
+# % #   #                        )) %>%
+# % #   # filter(value < 0) %>%
+# % #   group_by(variable, country) %>%
+# % #   na.omit() %>%
+# % #   mutate(#value = value / max(value), 
+# % #          value_log = log(value + 
+# % #                      abs(min(value, na.rm = T)) + .0001))
+# % # 
+# % # t <- merge(t, df_weights, by = 'id', all.x = T)
+# % # 
+# % # t$y <-(t$value_log - mean(t$value_log))
+# % # t$x <- (log(t$landown) - mean(log(t$landown)))
+# % # lmod <- lmer(y ~ x + (1 + x | country), 
+# % #              weights = weight_hh,
+# % #              data = t)
+# % # t1 <- romr.fnc(lmod, t, trim = 1.5)$data
+# % # unique(t1$country)
+# % # lmod <- update(lmod, data = t1)
+# % # plot(lmod)
+# % # qqnorm(residuals(lmod))
+# % # qqline(residuals(lmod))
+# % # hist(residuals(lmod))
+# % # dotplot(ranef(lmod, condVar = T))
+# % # summary(lmod)
+# % # 
+# % # plotly::ggplotly(
+# % # ggplot(t, aes(x, value)) +
+# % #   geom_smooth(aes(color = country), 
+# % #               method = 'lm',
+# % #               se = F)
+# % # )
+# % # 
+# % # 
+# % # 
+# % # 
+# % # tmp <- tmp[which(tmp$variable %in% c('totincome', 'agrincome',
+# % #                                      'crop', 'livestock',
+# % #                                      'cropvp', 'livstvp')),
+# % #            c('id', 'country', 'variable', 'value', 'landown')]
+# % # 
+# % # dat <- dcast(tmp, id + country ~ variable, value.var = 'value')
+# % # 
+# % # 
+# % # tmp1 <- tmp1[which(tmp1$variable %in% c('totincome', 'agrincome',
+# % #                                      'crop', 'livestock',
+# % #                                      'cropvp', 'livstvp')),
+# % #            c('id', 'country', 'variable', 'value', 'landown')]
+# % # tmp1_ <- dcast(tmp1, id + country ~ variable, value.var = 'value')
+# % # 
+# % # stargazer(dat, type = 'text')
+# % # stargazer(tmp1_, type = 'text')
+# % # 
+# % # plot_grid(
+# % # ggplot(tmp, aes(log(landown),
+# % #                 log(value + abs(min(value, na.rm = T)) + .001))) +
+# % #   geom_point() +
+# % #   geom_smooth() +
+# % #   facet_wrap(~ variable),
+# % # 
+# % # ggplot(tmp1, aes(log(landown),
+# % #                 log(value + abs(min(value, na.rm = T)) + .001))) +
+# % #   geom_point() +
+# % #   geom_smooth() +
+# % #   facet_wrap(~ variable)
+# % # )
+@
+
+
+\subsection{Compare to World Bank National Income}
+
+To identify outliers in the data, either from data entry or misreporting, we look across and within countries. First, we look across countries and years to see if any countries' standard errors per variable are much larger than the other countries. This information will tell us if there may be systematic processing errors of the micro-data at the country level that we can systematically correct. We also compare countries' mean and median per capita incomes with external datasets to understand if there are country level processing or survey instrument issues with the data.
+
+Second, we look within countries and years. We use the standard errors to detect anomalies. Using this approach within countries is more difficult to correct for than the across country level approach above. Within country anomalies most likely represent errors in data entry or inaccurate participant reporting. We will test how setting different thresholds for using the standard error of a variable to subset-out the within country and years anomalies can be used to reduce errors, while maintaining a reasonable variation per variable distribution.
+
+Plot A shows boxplots of annual per capita income by countries. The red line indicates the national GDP per capita in world bank compared to the purple line and boxplots that are from RuLIS. There is a systematically lower total income in the RuLIS data compared to the World Bank national averages; this may be driven by the RuLIS data focusing on rural areas.
+
+We compare the World Bank Per Capita Annual Income (2011 in PPP) with the RuLIS's mean Per Capita Annual Income (2011 in PPP) at the country level. Plot B shows a 1-1 line for reference. Plot C shows the ratios on a map.
+
+<<fig.cap="Comparisons to World Bank national income data. Plot A shows boxplots for the RuLIS income data (per capita per day in 2011 USD PPP); World Bank national averages are in red. The purple line are RuLIS's median overall value; the red line is the World Bank's median overall value. Plot B and C compares the ratio of RuLIS to World Bank per country. The black line in the scatter plot is a 1-1 line for comparison", fig.height=4, size='footnotesize', echo=F>>=
+# TODO: add in HH weights? adjust for rural income?
+
+df_hh$country_yr <- paste0(df_hh$country, ' - ', df_hh$year)
+tmp <- df_hh %>% 
+  filter(variable == 'totincome') %>% 
+  group_by(country_yr) %>%
+  mutate(median_wb = median(wb_gdp_2011_ppp / 365, na.rm = T),
+         median_rulis = median(value_ppp2011_pc, na.rm = T))
+
+combo <- function(x) sub('[^_]*_','', x )
+
+p1 <- ggplot(tmp, 
+             aes(x = reorder(country_yr, -wb_gdp_2011_ppp), 
+                 y = value_ppp2011_pc)) + 
+  geom_boxplot(outlier.shape = NA,
+               fill  = 'purple',
+               color = 'grey70',
+               alpha = 0.2) +
+  geom_point(aes(y = wb_gdp_2011_ppp / 365),
+             color = 'red',
+             size = 1,
+             group = 'National GDP') +
+  geom_hline(aes(yintercept = median(median_wb, na.rm = T),
+                 color = 'World Bank')) +
+  geom_hline(aes(yintercept = max(median_rulis, na.rm = T),
+             color = 'RuLIS')) +
+  scale_colour_manual(name = '',
+                      values = c('World Bank' = 'red', 
+                                 'RuLIS' = 'purple')) +
+  ylab('Per Capita Daily Income (2011 in PPP)') +
+  xlab('') +
+  coord_flip(ylim = c(-5, 50)) + 
+  scale_x_discrete(labels = combo) +
+  theme(axis.text = element_text(size = 7),
+        axis.title = element_text(size = 8))
+
+tmp <- df_hh %>% 
+  filter(variable == 'totincome') %>%
+  group_by(country, year)  %>%
+  summarise(median = median(value_ppp2011_pc, na.rm = T),
+            mean   = mean(value_ppp2011_pc, na.rm = T),
+            wb_gdp_2011_ppp = max(wb_gdp_2011_ppp / 365, na.rm = T)) %>%
+  ungroup()
+
+p2 <- ggplot(tmp,
+             aes(x = wb_gdp_2011_ppp, 
+                 y = mean,
+                 group = country)) +
+  geom_abline(aes(intercept = 0, 
+                  slope     = 1)) +
+  geom_smooth() +
+  geom_point(alpha = .7) +
+  xlim(0, 50) +
+  ylim(0, 50) +
+  xlab('World Bank Per Capita Daily Income (2011 in PPP)') +
+  ylab('RuLIS Per Capita Daily Income (2011 in PPP)') +
+  theme(axis.text = element_text(size = 7),
+        axis.title = element_text(size = 8))
+
+
+# Makes choropleth map
+tmp$region <- tmp$country
+map_world2  <- left_join(map_world, tmp, by = 'region')
+map_world2$Ratio <- map_world2$median / map_world2$wb_gdp_2011_ppp
+
+p3 <- ggplot(data = map_world2, 
+              aes(x = long, 
+                  y = lat, 
+                  group = group)) +
+    geom_polygon(aes(fill = Ratio), 
+                 color = 'grey50', 
+                 size  = .1) +
+    scale_fill_distiller(palette   = 'Purples', 
+                         direction = 1,
+                         na.value  = 'grey99') +
+    labs(title = 'Ratio RuLIS to National GDP Per Captia') +
+    theme_void() +
+    theme(legend.position = c(0.05,.4),
+          legend.key.width = unit(.15, 'cm')) +
+    coord_fixed() +
+    coord_proj('+proj=robin +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs')
+
+
+plot_grid(p1, p2, p3, nrow = 2, labels = 'auto', scale = .8)
+@
+
+
+
+
+% Note, leave section header commented; will make final pdf easier to read.
+% %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% \newpage
+% \section{Profit, Expenses, and Farm Size}
+% 
+% We use the following code chunk to construct the profit and expense variables.
+
+<<echo=F>>=
+construct_inc_exp_vars <- function(dat,
+                                   grouping = 'inc_*',
+                                   value_ = 'value_ppp2011_pc') {
+
+  # Constucts income or expense datasets based on grouping variable
+  # Params:
+  #   dat: df_hh
+  #   grouping: grepl function to id variable group
+  #   value: value variable
+  # Returns:
+  #   dat: wide dataframe with farmer type and group variables by value
+
+  # Subset for income variables
+  tmp <- dat[grepl(grouping, dat$grouping),]
+
+  # reshape data
+  # since dat was long form, take first id entry to not duplicate data
+  tmp1 <- tmp %>% select(variable.names(tmp)[c(1:6)])
+  tmp1 <- tmp1[!duplicated(tmp1$id),]
+
+  # cast dat variable and per ha value to wide form
+  tmp2 <- dcast(tmp, id ~ variable, value.var = value_)
+
+  # merge value_pc back with main dataframe
+  out <- merge(tmp1, tmp2, by = 'id', all.x = T, all.y = T)
+  tmp1 <- NULL
+  tmp2 <- NULL
+
+  # Add in the farmer type variables and relative farm size variables.
+  out <- merge(out, df_farmer_type, by = 'id', all.x = T)
+
+  return(out)
+}
+
+
+# Income per ha
+df_inc_ha <- construct_inc_exp_vars(df_hh,
+                                    grouping = 'inc_*',
+                                    value_ = 'value_ppp2011_ha')
+
+# Income per capita
+df_inc_pc <- construct_inc_exp_vars(df_hh,
+                                    grouping = 'inc_*',
+                                    value_ = 'value_ppp2011_pc')
+# Expenses per ha
+# df_exp_ha <- construct_inc_exp_vars(df_hh,
+#                                     grouping = 'exp_*',
+#                                     value_ = 'value_ppp2011_ha')
+# Expenses per capita
+# df_exp_pc <- construct_inc_exp_vars(df_hh,
+#                                     grouping = 'exp_*',
+#                                     value_ = 'value_ppp2011_pc')
+@
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\section{Poverty Analysis}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Research Questions}
+
+\begin{itemize}
+  \item What is the relationship between smallholders, profitability (profit/ha), and poverty (profit/capita)?
+  \item How do different dimensions of smallholders (e.g., spatial farm size, market orientation, reliance on family labor) relate to profit and poverty?
+\end{itemize}
+
+\subsection{Method Overview}
+
+(See manuscript for finalized methods)
+
+Since the key policy interest in smallholders is to support the most vulnerable farmers, we test how the different dimensions of smallholders explain on-farm productivity, on-farm income, and total income in real terms (i.e., 2011 USD PPP) and country relative terms (i.e., country level ranked percentiles). On-farm productivity and profits include crop and livestock production, and total productivity and profits include on and off-farm sources. Specifically, we look at the following dimensions of small-scale farms: actual farm size (ha), the relevant farm size (country level ranked percentiles), the relevant economic size (country level ranked percentiles), the percent of family labor used, the percent of female labor used, and the farming household's level of subsistence (definitions available in Table S 1). We define productivity by profit per ha and income by profit per person living in the farming household per day, where profit is defined by revenue minus operation expenses.
+
+Our methods are threefold. First, we explore the bivariate relationships between the different dimensions of smallholders and the different income metrics: on-farm income per ha, on-farm income per capita per day, and on and off-farm income per capita per day. We focus on the farming household as our unit of analysis as different labor compositions (e.g., percent family labor or percent female labor) typically affect other members of a household (CITE). 
+
+Second, we build mixed effect models to test if the relationships between the smallholder dimensions and productivity and income holds when controlling for other dimensions. We use each dimension of smallholders as fixed effects to test their relationships with the outcome variables; all variables are centered around their mean and standardized by their standard deviation in order to directly compare the direction and magnitude of their effect against the other independent variables. Survey sample weights were standardized per country between 0 and 1 and used as weights in each regression. Countries are set as a random effect to account for survey sampling differences, national policies, and other possible local contextual factors (2). Detailed tests of model specifications are in the Supplemental Information (SI). We tested if non-weighted regression, countries as fixed effects, and robust regressions changed our coefficients and error estimates; all models showed similar coefficients and standard errors. For the final model, we chose the weighted random effect model to ensure within country correlations were accounted, allow for generalizability of results to countries not in the analysis, and enable higher precision of estimates due to the sharing of information within the model’s structure (2, 3). In the RuLIS dataset, countries have different available variables. To ensure that we use the most countries and the most dimensions of smallholders, we conduct two different sets of regressions. Set A uses 34 countries and consists of farm size (relative and ha), relative economic size, and percent female labor. Set B uses 30 countries and consists of all the variables in Set A, but also percent family labor and percent subsistence (Figure S 1). The outcome variables for both sets remained the same. All results are included in the Supplemental Information (SI), but we focus on the country relevant terms, as these are directly related to the national poverty lines that we test against in the second stage of our analysis. We conduct separate regressions that include either farm size in actual and country relevant terms as these variables are highly correlated.
+
+For the third stage of our analysis, we conduct a simple set of scenarios to understand which farmers can transition out of poverty by doubling their incomes; SDG 2.3’s goal is to double the incomes of smallholders and SDG 1 is to eliminate poverty. These scenarios begin with doubling all farms’ per capita incomes and classifying farms into three groups per country: those that transitioned from below the national poverty line to above the poverty line (Group A), those that are still below the national poverty line even after doubling the income (Group B), and those that were already above the national poverty line (Group C). We then use the surveys sample weights and expansion factors to calculate what percentage of farmers will transition out of poverty with doubling their incomes and compare to the percentage of farmers that would transition out of poverty with a different tuning parameter (e.g., versus three, four, or five times their incomes). For all farms that have equal to or less than \$0 USD PPP incomes, we grouped them into Group B as doubling zeros and negative incomes becomes problematic and there were less than 3\% of these observations in our dataset.
+
+We then test how doubling certain groups of farmers’ incomes relates to farmers transitioning out of poverty. We use each of the key dimensions of smallholders we identified in the regression analysis to calculate how doubling different thresholds (i.e., doubling the incomes of farmers on the smallest 40\% of farms per country or farmers living in households with a female dominant labor force) relates to transitioning farmers out of poverty. We plot a range of thresholds to ask what the appropriate cut-off point is to have the most farmers transition out of poverty (e.g., will doubling the incomes of farmers on the smallest 40\% of farms get 100\% of farmers out of poverty or should we target the smallest 60\% of farms?). Since each dimension of smallholder captures different types of farms and farmers, we then combine the key definitions of smallholders and plot different thresholds to understand which combination and threshold will result in the highest number of farmers transitioning out of poverty when their incomes are doubled (e.g., the smallest 40\% of farms per country and farms with the lowest 40\% of revenues per country).
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Variables}
+
+Dependent variables include:
+
+\begin{itemize}
+  \item Agricultural profit per ha (2011 PPP and within country percent)
+  \item Agricultural profit per capita per day (2011 PPP and within country percent)
+  \item On and off farm profit per capita per day (2011 PPP and within country percent)
+\end{itemize}
+
+Independent variables are the farmer characteristic variables constructed in the above section, which include:
+
+\begin{itemize}
+  \item Farm size is defined by land ownership in ha; we log this value for the analysis.\\
+  (See diagnostic plots that compares this metric to other farm size relevant metrics available in RuLIS). ('landown')
+  \item Country relative farm size.\\
+  Farm sizes per country are in ranked percentages. ('rel\_landown').\\
+  This and the landown variable are used in separate models to ensure no collinearity and test their predictive power.
+  \item Percent family labor.\\
+  The percent of a household's expenditure on labor compared to total expenditure.\\
+  (Diagnostic plots that compares this metric to total family labor days over total labor days shows a near 1-to-1 relationship). ('p\_famLab')
+  \item Percent subsistence.\\
+  Percent value crop consumed to value of crop produced. ('p\_subsist')
+  \item Percent female labor. \\
+  Percent of number of female laborers in a household to all household members of labor age (15-60 years old)
+\end{itemize}
+
+
+<<echo=F>>=
+# Clean up environment before main analysis to save memory
+keep_vars <-  c('df_weights', 'df_inc_ha',
+                'df_inc_pc', 'map_world',
+                'packages', 'startTime', 'satargazer_type',
+                'min_ha', 'min_pc')
+ln <- length(ls()) - length(keep_vars)
+rm(list = ls()[!ls() %in% keep_vars])
+@
+
+<<echo=F>>=
+vs <- c('id', 'country', 'region',
+        'agrincome', 'totincome', 'crop', 'livestock',
+        'cropvp', 'livstvp',
+        'rel_landown', 'landown', 'dsmall',
+        'p_famLab', 'p_subsist',
+        'p_rain', 'p_femLab', 'rel_econsize')
+
+df_inc_ha <- df_inc_ha[, vs]
+df_inc_pc <- df_inc_pc[, vs]
+
+# clean up variable names into standard grepable format
+vs_tmp <- c('crop', 'livestock')
+
+for (x in vs_tmp) {
+  df_inc_ha[[paste0(x, 'income')]] <- df_inc_ha[[x]]
+  df_inc_pc[[paste0(x, 'income')]] <- df_inc_pc[[x]]
+  df_inc_ha[[x]] <- NULL
+  df_inc_pc[[x]] <- NULL
+}
+@
+
+We also look at revenue and expenditures to better understand the relative importance of crop, livestock, and off-farm sources. RuLIS provides crop, livestock, forestry, and fishery revenue, that they add together to create the agricultural income data. Since not all countries in our analysis have forestry and fishery data, we recalculate the agrincome variable to only be derived from the crop and livestock income variables; we also calculate an agricultural revenue variable from the crop and livestock revenue variables.
+
+<<echo=F>>=
+df_inc_pc$agrivp <- df_inc_pc$cropvp + df_inc_pc$livstvp
+df_inc_ha$agrivp <- df_inc_ha$cropvp + df_inc_ha$livstvp
+
+df_inc_pc$agrincome <- df_inc_pc$cropincome + df_inc_pc$livestockincome
+df_inc_ha$agrincome <- df_inc_ha$cropincome + df_inc_ha$livestockincome
+@
+
+Some of the income data is negative, which is expected. In order to later log the income data, we add 0.0001 and the minimum value across the income variables. We save the original values so we can correct for the constant later.
+
+<<echo=F>>=
+vs_tmp <- c('agrincome', 'totincome', 'cropincome', 'livestockincome')
+min_pc <- abs(min(df_inc_pc[, vs_tmp], na.rm = T)) + 0.0001
+min_ha <- abs(min(df_inc_ha[, vs_tmp], na.rm = T)) + 0.0001
+
+for (x in vs_tmp) {
+  x_adj <- paste0(x, '_adj')
+  df_inc_pc[[x_adj]] <- df_inc_pc[[x]] + min_pc
+  df_inc_ha[[x_adj]] <- df_inc_ha[[x]] + min_ha
+}
+@
+
+Since, the RuLIS expenditure data is broken into several categories that are not all available for all countries, we construct crop, livestock, and agricultural expense variables by taking the difference between revenue and profit. We make sure to adjust the revenue similar to how we adjusted the income data by adding the constant.
+
+<<echo=F>>=
+vs_inc <- c('agrincome_adj', 'cropincome_adj', 'livestockincome_adj')
+vs_exp <- c('agriexp', 'cropexp', 'liveexp')
+vs_vp  <- c('agrivp', 'cropvp', 'livstvp')
+
+for (i in 1:length(vs_inc)) {
+  df_inc_pc[[vs_exp[i]]] <- (df_inc_pc[[vs_vp[i]]] + min_pc) -
+                              df_inc_pc[[vs_inc[i]]]
+  df_inc_ha[[vs_exp[i]]] <- (df_inc_ha[[vs_vp[i]]] + min_ha) -
+                              df_inc_ha[[vs_inc[i]]]
+}
+@
+
+
+We calculate the within country percentiles for each revenue/expense/profit variable by a ranked method; these variables will represent percentiles per the sample (e.g., bottom 40\% is equal to .4).
+
+<<echo=F>>=
+country_normalize <- function(dat) { 
+  
+  vs_inc <- c('agrincome', 'totincome', 'cropincome', 'livestockincome')
+  vs_exp <- c('agriexp', 'cropexp', 'liveexp')
+  vs_vp  <- c('agrivp', 'cropvp', 'livstvp')
+  vs     <- c('id', 'country', 'region', 'rel_landown', 
+              'landown', 'dsmall', 'p_famLab', 'p_subsist',
+              'p_rain', 'p_femLab', 'rel_econsize')
+  
+  dat <- dat %>% select(c(vs, vs_inc, vs_exp, vs_vp))
+  dat <- melt(dat, id.vars = vs)
+  
+  # vale / max method
+  dat <- dat %>%
+    group_by(country, variable) %>%
+    mutate(
+      # value = (value + abs(min(value, na.rm = T))) /
+              # (max(value, na.rm = T) + abs(min(value, na.rm = T))),
+      value = value / max(value, na.rm = T),
+      value = ifelse(!is.finite(value), NA, value)
+      # rank = cumsum(ifelse(is.na(value), 0, value)) + value*0,
+      # value = rank / max(rank, na.rm = T)
+    )
+  
+  
+  # Rank method - odd to model
+  # dat <- dat %>%
+  # group_by(country, variable) %>%
+  # arrange(value, .by_group = T) %>%
+  # mutate(value = value + abs(min(value, na.rm = T)),
+  #        rank_value = 
+  #          cumsum(ifelse(is.na(value), 0, value)) + value*0,
+  #        value = rank_value / max(rank_value, na.rm = T)) %>% 
+  # ungroup()
+
+  dat <- dcast(dat,
+               as.formula(paste0(paste0(vs, collapse = ' + '), ' ~ variable')),
+               value.var = 'value')
+
+  return(dat)
+}
+
+p_df_inc_ha <- country_normalize(df_inc_ha)
+p_df_inc_pc <- country_normalize(df_inc_pc)
+@
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\section{Summary Stats}
+
+We were able to examine four dimensions of smallholders across 34 countries, consisting of 80,000 farming households (450,000 farmers). In the RulIS dataset, some countries have multiple years of surveys; in these cases we used the most recent survey. The median survey years across countries was 2013, ranging from 2005 to 2016.
+
+<<echo=F>>=
+vs_tmp <- c('id', 'Country', 'region',
+            'On-Farm Income', 'Total Income',
+            'Crop Revenue', 'Livestock Revenue',
+            'Farm Size (rel)', 'Farm Size (ha)',
+            'SDG 2.3 Smallholder',
+            'Family Labor', 'Subsistence',
+            'Rainfed', 'Female Labor',
+            'Crop Income', 'Livestock Income',
+            'On-Farm Revenue',
+            'On-Farm Income (adj)', 'Total Income (adj)',
+            'Crop Income (adj)', 'Livestock Income (adj)',
+            'On-Farm Expense',
+            'Crop Expense', 'Livestock Expense')
+
+vs_tmp1 <- c('Farm Size (ha)', 'Farm Size (rel)',
+            'Family Labor', 'Female Labor',
+            'Rainfed',
+            'SDG 2.3 Smallholder', 'Subsistence')
+
+vs_tmp2 <- c('Crop Revenue', 'Livestock Revenue', 'On-Farm Revenue',
+             'Crop Expense', 'Livestock Expense', 'On-Farm Expense',
+             'Crop Income', 'Livestock Income', 'On-Farm Income',
+             'Total Income')
+@
+
+<<echo=F, results='asis'>>=
+tmp <- df_inc_ha
+colnames(tmp) <- vs_tmp
+tmp <- tmp[, vs_tmp1]
+stargazer(tmp, type = satargazer_type,
+          digits = 2, title = 'Smallholder Dimension',
+          median = T)
+@
+
+<<echo=F, results='asis'>>=
+tmp <- df_inc_ha
+colnames(tmp) <- vs_tmp
+tmp <- tmp[, vs_tmp2]
+stargazer(tmp, type = satargazer_type,
+          digits = 0, title = 'Profit / ha',
+          median = T)
+@
+
+<<echo=F, results='asis'>>=
+tmp <- df_inc_pc
+colnames(tmp) <- vs_tmp
+tmp <- tmp[, vs_tmp2]
+stargazer(tmp, type = satargazer_type,
+          digits = 2, title = 'Profit / capita',
+          median = T)
+@
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\section{Marginal Plots}
+
+We look at the data in two ways: dollar amounts (2011 USD PPP) and relevant per country dollar amounts where each profit variable was normalized per country to be between 0 and 1 (e.g., a percent distribution). The per country percent distribution allows us to understand if within a country context, certain dimensions of smallholders relate to profit per ha and profit per capita. The percent distribution also helps reduce the across country variance.
+
+We will show marginal plots for both the dollar amounts and the percent distribution. Since our model will focus on the percent distribution, we will show additional marginal plots to explore the modeled response variable distributions.
+
+\subsection{2011 USD PPP}
+
+We plot each dimension of smallholder against the outcome variables. We also plot each smallholder dimension against crop, livestock, and total on-farm revenues and expenses. For the profit per capita per day outcome variable, we plot two poverty lines for convenience.
+
+There is a strong positive relationship between farm size (both in actual and relative terms) and profit per ha, as well as percent family labor - although this is a curved relationship. There is a strong negative relationship with the level of subsistence and profit per ha. The profit per capita relationships are not as clear for farm size, but it appears that as a farm has more family members working there is an increase of profit per ha (again, this is a curved relationship and there are heavy tails in the relationship due to the family farm variable being heavily left skewed). Female labor and the level of subsistence have negative relationships with profit per capita. (see "Estimating international poverty lines from comparable national thresholds" for discussion on different poverty lines).
+
+<<fig.cap='Relationships of each dimension of smallholder with revenues per ha, expenses per ha, profit per ha, and profit per capita. Seperate trends are given for crop production, livestock production, all on farm production, and on and off farm production where relevant. The bottom row contains two conventional poverty lines for comparability.', fig.height=6.5, out.width = '.95\\textwidth', size='footnotesize', echo=F>>=
+
+plot_tmp <- function(dat = tmp,
+                     x = 'landown',
+                     countype = 'vp',
+                     logx = F,
+                     logy = F,
+                     ylab = 'Revenue/ha',
+                     xlab = 'Farm Size (ha)',
+                     legend = F,
+                     povertyline = F) {
+
+  dat$x <- dat[[x]]
+
+  if (countype == 'income' & logy == T) {
+    vs_tmp <- grep('_adj', variable.names(dat), value = T)
+  } else {
+    vs_tmp <- grep(paste0(countype, '$'), variable.names(dat), value = T)
+  }
+
+  dat <- dat %>% select(country, x, vs_tmp)
+  dat <- melt(dat, id.vars = c('country', 'x'))
+  dat$variable <- substr(dat$variable, 1, 3)
+
+  if (logx == T){
+    dat$x <- log(dat$x)
+  }
+
+  if (logy == T) {
+    pov_1.9 <- log(1.9)
+    pov_3.2 <- log(3.2)
+    pov_5.5 <- log(5.5)
+    if (countype == 'income') {
+      if (povertyline == F) {
+        dat$value <- log(dat$value + min_ha) - log(min_ha)
+      } else {
+        dat$value <- log(dat$value + min_pc) - log(min_pc)
+      }
+    } else {
+      dat$value <- log(dat$value)
+    }
+  } else {
+    pov_1.9 <- 1.9
+    pov_3.2 <- 3.2
+    pov_5.5 <- 5.5
+  }
+
+  # if (povertyline == F) {
+    # dat <- dat[which(dat$variable != 'tot'),]
+  # }
+
+  # Define colors
+  colorCode <- c('#66c2a5','#fc8d62','#8da0cb','#e78ac3')
+  colors <- as.character(c('agr' = colorCode[1],
+                           'cro' = colorCode[2],
+                           'liv' = colorCode[3],
+                           'tot' = colorCode[4]))
+  colorScale <- scale_colour_manual(name = 'Revenue/Expenses',
+                                    values = colors,
+                                    labels = c('All Agriculture',
+                                               'Crop',
+                                               'Livestock',
+                                               'On and Off-Farm'))
+
+  # Paramaterize ylab
+  if (ylab != '') {
+    ylab <- paste(ylab, '\n(2011 PPP)\n')
+  }
+
+  # Plot
+  p <- ggplot(dat, aes(x, value)) +
+    geom_smooth(aes(color = variable),
+                # method = 'lm',
+                se = T,
+                size = 0.4) +
+    xlab(xlab) +
+    ylab(ylab)
+
+  if (povertyline == T) {
+    p <- p +
+      # geom_hline(aes(yintercept = pov_5.5, linetype = '$5.50'),
+      #            color = 'green',
+      #            size = .5) +
+      geom_hline(aes(yintercept = pov_3.2, linetype = '$3.20'),
+                 color = 'blue',
+                 size = .5) +
+      geom_hline(aes(yintercept = pov_1.9, linetype = '$1.90'),
+                 color = 'black',
+                 size = .5) +
+      scale_linetype_manual(name = 'Poverty Lines',
+                            values = c(2, 2),
+                            guide = guide_legend(
+                              override.aes = list(
+                                color = c('black', 'blue'))))
+
+  }
+
+  p <- p + colorScale
+
+  # Relabel x axis in non-logged terms
+  if (logx == T & x == 'landown') {
+    breaks <- c(0.1,.5,2,5,10,50,200)
+    p <- p + scale_x_continuous(breaks = log(breaks), labels = breaks)
+  }
+
+  # Set legend
+  if (legend == F) {
+    p <- p + theme(legend.position = 'none',
+                   legend.text = element_text(size = 7),
+                   legend.title = element_text(size = 7))
+  } else {
+    p <- p + theme(legend.position = c(1.05, 4.5))
+  }
+
+  p <- p + theme(axis.text = element_text(size = 6),
+                 axis.title = element_text(size = 7),
+                 legend.text = element_text(size = 7),
+                 text = element_text(size = 7))
+
+  return(p)
+}
+
+cts <- c('vp', 'exp', 'income', 'income')
+ylabs <- c('log( Revenue / ha )',
+           'log( Expenses / ha )',
+           'log( Profit / ha )',
+           'Profit / capita / day')
+
+xlabs <- c('Farm Size (ha)',
+           'Farm Size (rel)',
+           'Family Labor (%)',
+           'Female Labor (%)',
+           'Subsistence (%)',
+           'Rainfed (%)',
+           'Economic Size (rel)')
+
+# tmp_ha <- df_inc_ha %>%
+#   select(id, country, totincome, totincome_adj, landown) %>%
+#   filter(landown < 100)
+# 
+# tmp_pc <- df_inc_pc %>%
+#   select(id, country, totincome, totincome_adj, landown) %>%
+#   filter(landown < 100)
+# plot_grid(
+# plot_tmp(tmp_ha, x = 'landown', cts[3], logx = T, logy = T,
+#            xlab = xlabs[1], ylab = ylabs[3]) +
+#   theme(axis.text = element_text(size = 12),
+#         axis.title = element_text(size = 12)),
+# plot_tmp(tmp_pc, x = 'landown', cts[4], logx = T, logy = F,
+#            xlab = xlabs[1], ylab = ylabs[4]) +
+#   theme(axis.text = element_text(size = 12),
+#         axis.title = element_text(size = 12)))
+
+plot_grid(
+  plot_tmp(df_inc_ha, x = 'landown', cts[1], logx = T, logy = T,
+           xlab = '', ylab = ylabs[1]),
+  plot_tmp(df_inc_ha, x = 'rel_landown', cts[1], logx = F, logy = T,
+           xlab = '', ylab = ''),
+  plot_tmp(df_inc_ha, x = 'p_famLab', cts[1], logx = F, logy = T,
+           xlab = '', ylab = ''),
+  plot_tmp(df_inc_ha, x = 'p_femLab', cts[1], logx = F, logy = T,
+           xlab = '', ylab = ''),
+  plot_tmp(df_inc_ha, x = 'p_subsist', cts[1], logx = F, logy = T,
+           xlab = '', ylab = ''),
+  plot_tmp(df_inc_ha, x = 'p_rain', cts[1], logx = F, logy = T,
+           xlab = '', ylab = ''),
+  plot_tmp(df_inc_ha, x = 'rel_econsize', cts[1], logx = F, logy = T,
+           xlab = '', ylab = ''),
+  ggplot() + geom_blank(),
+
+  plot_tmp(df_inc_ha, x = 'landown', cts[2], logx = T, logy = T,
+           xlab = '', ylab = ylabs[2]),
+  plot_tmp(df_inc_ha, x = 'rel_landown', cts[2], logx = F, logy = T,
+           xlab = '', ylab = ''),
+  plot_tmp(df_inc_ha, x = 'p_famLab', cts[2], logx = F, logy = T,
+           xlab = '', ylab = ''),
+  plot_tmp(df_inc_ha, x = 'p_femLab', cts[2], logx = F, logy = T,
+           xlab = '', ylab = ''),
+  plot_tmp(df_inc_ha, x = 'p_subsist', cts[2], logx = F, logy = T,
+           xlab = '', ylab = ''),
+  plot_tmp(df_inc_ha, x = 'p_rain', cts[2], logx = F, logy = T,
+           xlab = '', ylab = ''),
+  plot_tmp(df_inc_ha, x = 'rel_econsize', cts[2], logx = F, logy = T,
+           xlab = '', ylab = ''),
+  ggplot() + geom_blank(),
+
+  plot_tmp(df_inc_ha, x = 'landown', cts[3], logx = T, logy = T,
+           xlab = '', ylab = ylabs[3]),
+  plot_tmp(df_inc_ha, x = 'rel_landown', cts[3], logx = F, logy = T,
+           xlab = '', ylab = ''),
+  plot_tmp(df_inc_ha, x = 'p_famLab', cts[3], logx = F, logy = T,
+           xlab = '', ylab = ''),
+  plot_tmp(df_inc_ha, x = 'p_femLab', cts[3], logx = F, logy = T,
+           xlab = '', ylab = ''),
+  plot_tmp(df_inc_ha, x = 'p_subsist', cts[3], logx = F, logy = T,
+           xlab = '', ylab = ''),
+  plot_tmp(df_inc_ha, x = 'p_rain', cts[3], logx = F, logy = T,
+           xlab = '', ylab = ''),
+  plot_tmp(df_inc_ha, x = 'rel_econsize', cts[3], logx = F, logy = T,
+           xlab = '', ylab = ''),
+  ggplot() + geom_blank(),
+
+  plot_tmp(df_inc_pc, x = 'landown', cts[4], logx = T, logy = F,
+           xlab = xlabs[1], ylab = ylabs[4],
+           povertyline = T),
+  plot_tmp(df_inc_pc, x = 'rel_landown', cts[4], logx = F, logy = F,
+           xlab = xlabs[2], ylab = '',
+           povertyline = T),
+  plot_tmp(df_inc_pc, x = 'p_famLab', cts[4], logx = F, logy = F,
+           xlab = xlabs[3], ylab = '',
+           povertyline = T),
+  plot_tmp(df_inc_pc, x = 'p_femLab', cts[4], logx = F, logy = F,
+           xlab = xlabs[4], ylab = '',
+           povertyline = T),
+  plot_tmp(df_inc_pc, x = 'p_subsist', cts[4], logx = F, logy = F,
+           xlab = xlabs[5], ylab = '',
+           povertyline = T),
+  plot_tmp(df_inc_pc, x = 'p_rain', cts[4], logx = F, logy = F,
+           xlab = xlabs[6], ylab = '',
+           povertyline = T),
+  plot_tmp(df_inc_pc, x = 'rel_econsize', cts[4], logx = F, logy = F,
+           xlab = xlabs[7], ylab = '', 
+           povertyline = T, legend = T),
+  ggplot() + geom_blank(),
+
+  labels = c('a','b','c','d','e','f','','',
+             'g','h','i','j','k','l','','',
+             'm','n','o','p','q','r','','',
+             's','t','u','v','w','x','',''),
+
+  rel_widths = rep(c(1.1,1,1,1,1,1,1,.7), 4),
+  label_size = 7,
+  hjust = 0,
+  ncol = 8)
+@
+
+<<echo=F>>=
+# We also want to understand how the proposed SDG 2.3 smallholder definition (which is binary) relates to the income variables. It seems like smallholders have lower agricultural incomes per person compared to non-smallholders. There is no difference between small and non-smallholders for total income.
+# 
+# <<fig.cap='Relationships of the SDG binary definition of smallholder with revenues per ha, expenses per ha, profit per ha, and profit per capita. Seperate trends are given for crop production, livestock production, all on farm production, and on and off farm production where relevant.', out.width = '.95\\textwidth', size='footnotesize', echo=F>>=
+# plot_sdg_smallholders <- function(dat1, dat2) {
+# 
+#   tmp1 <- dat1
+#   tmp1 <- tmp1[, c(
+#     'id', 'country', 'dsmall',
+#     c(grep(paste0('vp', '$'), variable.names(tmp1), value = T),
+#       grep(paste0('exp', '$'), variable.names(tmp1), value = T),
+#       grep(paste0('income', '$'), variable.names(tmp1), value = T)))]
+# 
+#   tmp1 <- melt(tmp1, id.vars = c('id', 'country', 'dsmall'))
+#   tmp1$denom <- 'per capita'
+#   tmp1 <- na.omit(tmp1)
+# 
+# 
+#   tmp2 <- dat2
+#   tmp2 <- tmp2[, c(
+#     'id', 'country', 'dsmall',
+#     c(grep(paste0('vp', '$'), variable.names(tmp2), value = T),
+#       grep(paste0('exp', '$'), variable.names(tmp2), value = T),
+#       grep(paste0('income', '$'), variable.names(tmp2), value = T)))]
+# 
+#   tmp2 <- melt(tmp2, id.vars = c('id', 'country', 'dsmall'))
+#   tmp2$denom <- 'per ha'
+#   tmp2 <- na.omit(tmp2)
+# 
+#   dat <- rbind(tmp1, tmp2)
+#   dat$x2 <- as.factor(dat$dsmall)
+#   levels(dat$x2) <- c('Not Smallholder', 'Smallholder')
+# 
+#   vs_tmp2 <- c('Crop Revenue', 'Livestock Revenue', 'On-Farm Revenue',
+#                'Crop Expense', 'Livestock Expense', 'On-Farm Expense',
+#                'Crop Income', 'Livestock Income', 'On-Farm Income',
+#                'Total Income')
+# 
+#   vs_tmp <- data.frame(variable = sort(unique(as.character(dat$variable))),
+#                        variable_fix = c(
+#                          'On-Farm Expense', 
+#                          'On-Farm Income', 
+#                          'On-Farm Revenue',
+#                          'Crop Expense', 
+#                          'Crop Income',
+#                          'Crop Revenue',
+#                          'Livestock Expense',
+#                          'Livestock Income', 
+#                          'Livestock Revenue',
+#                          'Total Income'))
+#   dat <- merge(dat, vs_tmp, by = 'variable', all.x = T)
+#   dat$variable <- NULL
+#   dat$variable <- dat$variable_fix
+# 
+#   dat$x2 <- ordered(dat$x2, levels = c('Smallholder', 'Not Smallholder'))
+#   dat$variable <- ordered(dat$variable, 
+#                           levels = c(
+#                             'Crop Income', 
+#                             'Crop Expense', 
+#                             'Crop Revenue',
+#                             'Livestock Income', 
+#                             'Livestock Expense',
+#                             'Livestock Revenue',
+#                             'On-Farm Income', 
+#                             'On-Farm Expense', 
+#                             'On-Farm Revenue',
+#                             'Total Income'))
+# 
+#   fences <- dat %>%
+#     group_by(denom, variable, x2) %>%
+#     summarise(ul = quantile(value)[4] + 1.5 * IQR(value),
+#               ll = quantile(value)[4] + 1.5 * IQR(value))
+# 
+#   stats_ <- dat %>%
+#     group_by(denom, variable, x2) %>%
+#     summarise(ymin = boxplot.stats(value)$stats[1],
+#               lower = boxplot.stats(value)$stats[2],
+#               middle = boxplot.stats(value)$stats[3],
+#               upper = boxplot.stats(value)$stats[4],
+#               ymax = boxplot.stats(value)$stats[5])
+# 
+#   p1 <- ggplot(stats_, aes(x = x2,
+#                      lower = lower,
+#                      upper = upper,
+#                      middle = middle,
+#                      ymin = ymin,
+#                      ymax = ymax)) +
+#     geom_boxplot(stat = 'identity') +
+#     labs(color = '') +
+#     ylab('Value 2011 USD PPP') +
+#     xlab('') +
+#     facet_wrap(~ variable + denom, ncol = 6, scales = 'free_y') +
+#     theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+#           axis.text.y = element_text(hjust = 1, size = 7),
+#           axis.title = element_text(size = 9),
+#           strip.text = element_text(size = 9))
+# 
+#   return(p1)
+# }
+# plot_sdg_smallholders(df_inc_pc, df_inc_ha)
+@
+
+We examine the relationships between the dimensions of smallholders in a correlation heatmap using Spearman Rank. Family labor and farm size (both actual and relative) are moderately negative correlated.
+
+<<fig.cap='Spearman rank correlations between each dimension of smallholder.', fig.height=3, size='footnotesize', echo=F>>=
+# Correlation heatmap
+# cor_heatmap functions the same as above; this one is cleaner
+cor_heatmap <- function(dat = df_inc_ha,
+                        c = 'Spearman',
+                        text = F,
+                        c_method = 'mcquitty') {
+  # Produces heatmap of correlation matrix
+  # Params:
+  #   cormat: correlation matrix, example:
+  #   cormat <- round(cor(df_pc[,3:length(df_pc)],
+  #                   method = 'spearman',
+  #                   use = 'pairwise.complete.obs'), 2)
+  #   c: legend label
+  #   text: boolean correlation value text plotted
+  #   c_method: clustering method to use to order heatmap, choose:
+  #             'ward.D', 'ward.D2', 'single', 'complete',
+  #             'average', 'mcquitty', 'median', 'centroid'
+  # Returns:
+  #   p: ggplot object
+
+  dat[['Farm Size (ha)']] <- log(dat$landown)
+  dat[['Farm Size (rel)']] <- dat$rel_landown
+  # dat[['SDG 2.3 Smallholder']] <- dat$dsmall
+  dat[['Economic Size (rel)']] <- dat$rel_econsize
+  dat[['Family Labour']] <- dat$p_famLab
+  dat[['Female Labour']] <- dat$p_femLab
+  # dat[['Rainfed']] <- dat$p_rain
+  dat[['Subsistence']] <- dat$p_subsist
+
+  dat <- dat[, c('Farm Size (ha)',
+                 'Farm Size (rel)',
+                 # 'SDG 2.3 Smallholder',
+                 'Economic Size (rel)',
+                 'Family Labour',
+                 'Female Labour',
+                 # 'Rainfed',
+                 'Subsistence')]
+
+  cormat <- round(cor(dat,
+                      method = 'spearman',
+                      use = 'pairwise.complete.obs'), 2)
+
+
+  reorder_cormat <- function(cormat){
+    # Use correlation between variables as distance
+    dd <- as.dist((1 - cormat) / 2)
+    hc <- hclust(dd, method = c_method)
+    cormat <- cormat[hc$order, hc$order]
+    return(cormat)
+  }
+
+  get_lower_tri <- function(cormat){
+    # Get upper triangle of the correlation matrix; remove diagonal
+    cormat[upper.tri(cormat)] <- NA
+    diag(cormat) <- NA
+    return(cormat)
+    }
+
+  r_cormat <- reorder_cormat(cormat)
+  lower_tri <- get_lower_tri(r_cormat)
+  m_cormat <- melt(lower_tri, na.rm = T)
+
+  p <- ggplot(m_cormat,
+              aes(Var1, Var2, fill = value)) +
+    geom_tile(color = 'grey70') +
+    scale_fill_gradient2(low = 'purple', high = 'green', mid = 'white',
+                         midpoint = 0, limit = c(-1,1), space = 'Lab',
+                         name = c) +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1,
+                                     size = 12, hjust = 1)) +
+   coord_fixed()
+
+  if (text == T) {
+    p <- p + geom_text(aes(label = value), size = 2)
+  }
+
+  return(p)
+}
+
+p1 <- cor_heatmap(text = T) + xlab('') + ylab('')  +
+  theme(axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 7),
+        text = element_text(size = 7))
+p1
+@
+
+In order to better understand the outcome variables (on-farm and total income per ha and per capita), we plot their distributions. Since different countries have varying ranges of observations, we also looked at each country (not shown due to the number of panels) and found each country to have a very similar right skewed distribution. In the next section, we normalize the profit data at the country level, which allows us to minimize the cross country variation and focus on the smallholder to profit relationships.
+
+<<fig.cap='Distributions of total income and agricultral income per country (in colors).', out.width = '.95\\textwidth', size='footnotesize',fig.height=4, echo=F>>=
+vs <- c('id', 'country', 'region', 
+        'rel_landown', 'landown', 'dsmall', 'rel_econsize',
+        'p_famLab', 'p_subsist', 'p_rain', 'p_femLab')
+vs_inc <- c('agrincome', 'totincome')
+
+tmp <- df_inc_ha[, c(vs, vs_inc)]
+tmp <- melt(tmp, id.vars = vs)
+p1 <- ggplot(tmp, aes(value, color = country)) +
+  geom_density() +
+  facet_wrap(~ variable, scales = 'free') +
+  xlab('Value per ha') +
+  guides(color = F)
+
+tmp <- df_inc_pc[, c(vs, vs_inc)]
+tmp <- melt(tmp, id.vars = vs)
+p2 <- ggplot(tmp, aes(value, color = country)) +
+  geom_density() +
+  facet_wrap(~ variable, scales = 'free') +
+  xlab('Value per capita') +
+  guides(color = F)
+
+plot_grid(p1, p2, ncol = 1)
+@
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\subsection{Country Relevant Income}
+
+Now we explore the country relevant revenue/expense/profit data.
+
+We plot each dimension of smallholder against the outcome variables. We also plot each smallholder dimension against crop, livestock, and total on-farm revenues and expenses. These plots provide interesting insight because although smaller farms are more profitable per ha, they represent the lower incomes in a country.
+
+The results are similar to the plots above that show the per dollar relationships, but there is much more of a relationship between farm size (both actual and especially relevant) and profit per capita. This suggests that while smaller farms are more profitable per ha, they are less profitable per person.
+
+<<fig.cap='Relationships of each dimension of smallholder with revenues per ha, expenses per ha, profit per ha, and profit per capita. Seperate trends are given for crop production, livestock production, all on farm production, and on and off farm production where relevant.', out.width = '.95\\textwidth', size='footnotesize', fig.height=6.5, echo=F>>=
+cts <- c('vp', 'exp', 'income', 'income')
+ylabs <- c('Revenue / ha',
+           'Expenses / ha',
+           'Profit / ha',
+           'Profit / capita / day')
+
+xlabs <- c('Farm Size (ha)',
+           'Farm Size (rel)',
+           'Family Labor (%)',
+           'Female Labor (%)',
+           'Subsistence (%)',
+           'Rainfed (%)',
+           'Economic Size (rel)')
+
+tmp_p_df_inc_ha <- p_df_inc_ha
+tmp_p_df_inc_pc <- p_df_inc_pc
+
+plot_grid(
+  plot_tmp(tmp_p_df_inc_ha, x = 'landown', cts[1], logx = T, logy = F,
+           xlab = '', ylab = ylabs[1]),
+  plot_tmp(tmp_p_df_inc_ha, x = 'rel_landown', cts[1], logx = F, logy = F,
+           xlab = '', ylab = ''),
+  plot_tmp(tmp_p_df_inc_ha, x = 'p_famLab', cts[1], logx = F, logy = F,
+           xlab = '', ylab = ''),
+  plot_tmp(tmp_p_df_inc_ha, x = 'p_femLab', cts[1], logx = F, logy = F,
+           xlab = '', ylab = ''),
+  plot_tmp(tmp_p_df_inc_ha, x = 'p_subsist', cts[1], logx = F, logy = F,
+           xlab = '', ylab = ''),
+  plot_tmp(tmp_p_df_inc_ha, x = 'p_rain', cts[1], logx = F, logy = F,
+           xlab = '', ylab = ''),
+  plot_tmp(tmp_p_df_inc_ha, x = 'rel_econsize', cts[1], logx = F, logy = F,
+           xlab = '', ylab = ''),
+  ggplot() + geom_blank(),
+
+  plot_tmp(tmp_p_df_inc_ha, x = 'landown', cts[2], logx = T, logy = F,
+           xlab = '', ylab = ylabs[2]),
+  plot_tmp(tmp_p_df_inc_ha, x = 'rel_landown', cts[2], logx = F, logy = F,
+           xlab = '', ylab = ''),
+  plot_tmp(tmp_p_df_inc_ha, x = 'p_famLab', cts[2], logx = F, logy = F,
+           xlab = '', ylab = ''),
+  plot_tmp(tmp_p_df_inc_ha, x = 'p_femLab', cts[2], logx = F, logy = F,
+           xlab = '', ylab = ''),
+  plot_tmp(tmp_p_df_inc_ha, x = 'p_subsist', cts[2], logx = F, logy = F,
+           xlab = '', ylab = ''),
+  plot_tmp(tmp_p_df_inc_ha, x = 'p_rain', cts[2], logx = F, logy = F,
+           xlab = '', ylab = ''),
+  plot_tmp(tmp_p_df_inc_ha, x = 'rel_econsize', cts[2], logx = F, logy = F,
+           xlab = '', ylab = ''),
+  ggplot() + geom_blank(),
+
+  plot_tmp(tmp_p_df_inc_ha, x = 'landown', cts[3], logx = T, logy = F,
+           xlab = '', ylab = ylabs[3]),
+  plot_tmp(tmp_p_df_inc_ha, x = 'rel_landown', cts[3], logx = F, logy = F,
+           xlab = '', ylab = ''),
+  plot_tmp(tmp_p_df_inc_ha, x = 'p_famLab', cts[3], logx = F, logy = F,
+           xlab = '', ylab = ''),
+  plot_tmp(tmp_p_df_inc_ha, x = 'p_femLab', cts[3], logx = F, logy = F,
+           xlab = '', ylab = ''),
+  plot_tmp(tmp_p_df_inc_ha, x = 'p_subsist', cts[3], logx = F, logy = F,
+           xlab = '', ylab = ''),
+  plot_tmp(tmp_p_df_inc_ha, x = 'p_rain', cts[3], logx = F, logy = F,
+           xlab = '', ylab = ''),
+  plot_tmp(tmp_p_df_inc_ha, x = 'rel_econsize', cts[3], logx = F, logy = F,
+           xlab = '', ylab = ''),
+  ggplot() + geom_blank(),
+
+  plot_tmp(tmp_p_df_inc_pc, x = 'landown', cts[4], logx = T, logy = F,
+           xlab = xlabs[1], ylab = ylabs[4],
+           povertyline = F),
+  plot_tmp(tmp_p_df_inc_pc, x = 'rel_landown', cts[4], logx = F, logy = F,
+           xlab = xlabs[2], ylab = '',
+           povertyline = F),
+  plot_tmp(tmp_p_df_inc_pc, x = 'p_famLab', cts[4], logx = F, logy = F,
+           xlab = xlabs[3], ylab = '',
+           povertyline = F),
+  plot_tmp(tmp_p_df_inc_pc, x = 'p_femLab', cts[4], logx = F, logy = F,
+           xlab = xlabs[4], ylab = '',
+           povertyline = F),
+  plot_tmp(tmp_p_df_inc_pc, x = 'p_subsist', cts[4], logx = F, logy = F,
+           xlab = xlabs[5], ylab = '',
+           povertyline = F),
+  plot_tmp(tmp_p_df_inc_pc, x = 'p_rain', cts[4], logx = F, logy = F,
+           xlab = xlabs[6], ylab = '',
+           povertyline = F, legend = T),
+  plot_tmp(tmp_p_df_inc_pc, x = 'rel_econsize', cts[4], logx = F, logy = F,
+           xlab = xlabs[7], ylab = ''),
+  ggplot() + geom_blank(),
+
+  labels = c('a','b','c','d','e','f','','',
+             'g','h','i','j','k','l','','',
+             'm','n','o','p','q','r','','',
+             's','t','u','v','w','x','',''),
+
+  rel_widths = rep(c(1.1,1,1,1,1,1,1,.7), 4),
+  label_size = 7,
+  hjust = 0,
+  ncol = 8)
+@
+
+<<echo=F, include=F>>=
+# For the manuscript, we combine the actual and relative panel plots
+ylabs <- c('Profit / ha (relative)',
+           'Profit / capita / day (relative)',
+           'Profit / ha (log actual)',
+           'Profit / capita / day (actual)')
+
+xlabs <- c('Farm Size (ha)',
+           'Farm Size (rel)',
+           'Family Labor (%)',
+           'Female Labor (%)',
+           'Subsistence (%)',
+           'Economic Size (rel)')
+plot_grid(
+  plot_tmp(tmp_p_df_inc_ha, x = 'landown', 'income', logx = T, logy = F,
+           xlab = '', ylab = ylabs[1]),
+  plot_tmp(tmp_p_df_inc_ha, x = 'rel_landown', 'income', logx = F, logy = F,
+           xlab = '', ylab = ''),
+  plot_tmp(tmp_p_df_inc_ha, x = 'p_famLab', 'income', logx = F, logy = F,
+           xlab = '', ylab = '') + scale_x_continuous(trans = 'reverse'),
+  plot_tmp(tmp_p_df_inc_ha, x = 'p_femLab', 'income', logx = F, logy = F,
+           xlab = '', ylab = '') + scale_x_continuous(trans = 'reverse'),
+  plot_tmp(tmp_p_df_inc_ha, x = 'p_subsist', 'income', logx = F, logy = F,
+           xlab = '', ylab = '') + scale_x_continuous(trans = 'reverse'),
+  plot_tmp(tmp_p_df_inc_ha, x = 'rel_econsize', 'income', logx = F, logy = F,
+           xlab = '', ylab = ''),
+  
+  ggplot() + geom_blank(),
+  
+  plot_tmp(tmp_p_df_inc_pc, x = 'landown', 'income', logx = T, logy = F,
+           xlab = '', ylab = ylabs[2]),
+  plot_tmp(tmp_p_df_inc_pc, x = 'rel_landown', 'income', logx = F, logy = F,
+           xlab = '', ylab = ''),
+  plot_tmp(tmp_p_df_inc_pc, x = 'p_famLab', 'income', logx = F, logy = F,
+           xlab = '', ylab = '') + scale_x_continuous(trans = 'reverse'),
+  plot_tmp(tmp_p_df_inc_pc, x = 'p_femLab', 'income', logx = F, logy = F,
+           xlab = '', ylab = '') + scale_x_continuous(trans = 'reverse'),
+  plot_tmp(tmp_p_df_inc_pc, x = 'p_subsist', 'income', logx = F, logy = F,
+           xlab = '', ylab = '') + scale_x_continuous(trans = 'reverse'),
+  plot_tmp(tmp_p_df_inc_pc, x = 'rel_econsize', 'income', logx = F, logy = F,
+           xlab = '', ylab = ''),
+  
+  ggplot() + geom_blank(),
+  
+  plot_tmp(df_inc_ha, x = 'landown', 'income', logx = T, logy = T,
+           xlab = '', ylab = ylabs[3]),
+  plot_tmp(df_inc_ha, x = 'rel_landown', 'income', logx = F, logy = T,
+           xlab = '', ylab = ''),
+  plot_tmp(df_inc_ha, x = 'p_famLab', 'income', logx = F, logy = T,
+           xlab = '', ylab = '') + scale_x_continuous(trans = 'reverse'),
+  plot_tmp(df_inc_ha, x = 'p_femLab', 'income', logx = F, logy = T,
+           xlab = '', ylab = '') + scale_x_continuous(trans = 'reverse'),
+  plot_tmp(df_inc_ha, x = 'p_subsist', 'income', logx = F, logy = T,
+           xlab = '', ylab = '') + scale_x_continuous(trans = 'reverse'),
+  plot_tmp(df_inc_ha, x = 'rel_econsize', 'income', logx = F, logy = T,
+           xlab = '', ylab = ''),
+  
+  ggplot() + geom_blank(),
+  
+  plot_tmp(df_inc_pc, x = 'landown', 'income', logx = T, logy = F,
+           xlab = xlabs[1], ylab = ylabs[4], povertyline = T),
+  plot_tmp(df_inc_pc, x = 'rel_landown', 'income', logx = F, logy = F,
+           xlab = xlabs[2], ylab = '', povertyline = T),
+  plot_tmp(df_inc_pc, x = 'p_famLab', 'income', logx = F, logy = F,
+           xlab = xlabs[3], ylab = '', povertyline = T) + 
+    scale_x_continuous(trans = 'reverse'),
+  plot_tmp(df_inc_pc, x = 'p_femLab', 'income', logx = F, logy = F,
+           xlab = xlabs[4], ylab = '', povertyline = T) + 
+    scale_x_continuous(trans = 'reverse'),
+  plot_tmp(df_inc_pc, x = 'p_subsist', 'income', logx = F, logy = F,
+           xlab = xlabs[5], ylab = '', povertyline = T) + 
+    scale_x_continuous(trans = 'reverse'),
+  plot_tmp(df_inc_pc, x = 'rel_econsize', 'income', logx = F, logy = F,
+           xlab = xlabs[6], ylab = '', povertyline = T, legend = T),
+
+  ggplot() + geom_blank(),
+
+  labels = c('a','b','c','d','e','f','',
+             'g','h','i','j','k','l','',
+             'm','n','o','p','q','r','',
+             's','t','u','v','w','x',''),
+
+  rel_widths = rep(c(1.1,1,1,1,1,1,.7), 4),
+  label_size = 7,
+  hjust = 0,
+  ncol = 7)
+@
+
+<<echo=F>>=
+# We also want to understand how the proposed SDG 2.3 smallholder definition (which is binary) relates to the income variables. It seems like smallholders have lower incomes per person compared to non-smallholders. There is no difference between small and non-smallholders for incomes per ha.
+# 
+# <<fig.cap='Relationships of the SDG binary definition of smallholder with revenues per ha, expenses per ha, profit per ha, and profit per capita. Seperate trends are given for crop production, livestock production, all on farm production, and on and off farm production where relevant.', out.width = '.95\\textwidth', size='footnotesize', echo=F>>=
+# plot_sdg_smallholders(p_df_inc_pc, p_df_inc_ha)
+@
+
+In order to better understand the outcome variables (on-farm and total income per ha and per capita), we plot their distributions.
+
+<<fig.cap='Distributions of total income and agricultral income per country (in colors).', out.width = '.95\\textwidth', size='footnotesize',fig.height=4, echo=F>>=
+vs <- c('id', 'country', 'region', 
+        'rel_landown', 'landown', 'dsmall', 'rel_econsize',
+        'p_famLab', 'p_subsist', 'p_rain', 'p_femLab')
+vs_inc <- c('agrincome', 'totincome')
+
+tmp <- p_df_inc_ha[, c(vs, vs_inc)]
+tmp <- melt(tmp, id.vars = vs)
+p1 <- ggplot(tmp, aes(value, color = country)) +
+  geom_density() +
+  facet_wrap(~ variable, scales = 'free') +
+  xlab('Value per ha') +
+  guides(color = F)
+
+tmp <- p_df_inc_pc[, c(vs, vs_inc)]
+tmp <- melt(tmp, id.vars = vs)
+p2 <- ggplot(tmp, aes(value, color = country)) +
+  geom_density() +
+  facet_wrap(~ variable, scales = 'free') +
+  xlab('Value per capita') +
+  guides(color = F)
+
+plot_grid(p1, p2, ncol = 1)
+@
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\section{Analysis - Identifying Smallholder Dimensions}
+\subsection{Overview}
+
+We model how different dimensions of smallholders (farm size, level of subsistence, family labor dependence, female labor dependence, and rainfed production) relate to the outcome variables: agricultural profit/ha, agricultural profit/capita/day, and total profit/capita/day.
+
+Since not all variables are available for all countries in RuLIS, we create two subsets of the data to allow testing different combinations of the independent variables with the most amount of countries included. For each subset, we test the independent variables separately then as a group to understand their relationships to the dependent variable and their relative contribution to explaining the variance. We test actual farm size and relative farm size separately as they are highly correlated. The two subgroups are:
+
+\begin{enumerate}
+  \item Subgroup 1 (34 countries): the binary smallholder definition, farm area, relative farm area, and the percent of female labor
+  \item Subgroup 2 (30 countries): subgroup 1 plus percent family labor and percent subsistence
+\end{enumerate}
+
+<<fig.cap='Map of the different subgroups we use for our analysis. Subgroup 1 (both colors) contains 34 countries and subgroup 2 (only green) contains 30 countries. Each subgroup analysis uses a different selection of predictor variables.', out.width = '.95\\textwidth', size='footnotesize',fig.height=2.5, echo=F>>=
+plot_map_subs <- function(dat) {
+
+  tmp <- dat[, c('id', 'country',
+                 'rel_landown', 'landown',
+                 'p_femLab', 'p_famLab',
+                 'p_rain', 'p_subsist',
+                 'dsmall', 'rel_econsize')]
+
+  tmp$group <- ifelse(!is.na(tmp$p_rain),
+                      3,
+               ifelse(!is.na(tmp$p_famLab) &
+                      !is.na(tmp$p_subsist),
+                      2,
+               ifelse(!is.na(tmp$rel_landown) &
+                     !is.na(tmp$landown) &
+                     !is.na(tmp$p_femLab) &
+                     !is.na(tmp$rel_econsize),
+                     1, NA)))
+
+  tmp <- tmp[which(tmp$group != 3),]
+  tmp <- tmp[order(tmp$group, decreasing = T),]
+  tmp <- na.omit(unique(tmp[, c('country', 'group')]))
+  colnames(tmp) <- c('region', 'group_no')
+  map_world2 <- full_join(map_world, tmp, by = 'region')
+
+  p1 <- ggplot() +
+        geom_polygon(data = map_world,
+                aes(x = long,
+                    y = lat,
+                    group = group),
+                 color = 'white',
+                 fill = 'grey70',
+                 size  = .1) +
+      geom_polygon(data = map_world2,
+                aes(x = long,
+                    y = lat,
+                    fill = factor(group_no),
+                    group = group),
+                   color = 'white',
+                   size  = .1,
+                   alpha = .7) +
+      labs(title = '') +
+      scale_fill_discrete('Subgroup',
+                          # palette = 1,
+                          # breaks = c(1,2),
+                          # labels = c('1', '2'),
+                          na.value = 'grey70') +
+      theme_void() +
+      theme(legend.text = element_text(size = 8),
+            legend.title = element_text(size = 9)) +
+      # theme(legend.position = c(0.1,.4),
+      #       legend.key.width = unit(.15, 'cm')) +
+      coord_fixed() +
+      coord_proj('+proj=robin +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs')
+
+  return(p1)
+}
+
+plot_map_subs(p_df_inc_ha)
+@
+
+\subsection{Model Specification}
+
+To test model specifications, we used multiple iterations of a random subset of the data to quicken testing given the robust models we were testing against could only handle a portion of the dataset at once. Through iteration (not shown) we found our diagnostics showed similar findings. For brevity of this document, we show one set of diagnostics for subset 2 for per ha relative incomes, the other diagnostics showed similar results similar. For each variable and country subset, we tested using countries as a fixed or random effect and tested using sampling weights, no weights, or robust weights. We also explored other general linear models (mixed (GLMM) and fixed (GLM)) to deal with the observed non-linearity and heteroskedasticity. In the end, a weighted linear mixed effects model was used since it provided similar coefficients and standard errors (e.g., the intuition gained from all models was very similar) as the robust fixed effect model, robust random effects model, and the wide range of GLMM/GLM parametrization (e.g., beta family and tweedie mixture models with a variety of link functions), while enabling a cleaner interpretation than several of the GLMM/GLM models.
+
+<<echo=F>>=
+# Useful site: https://rlbarter.github.io/Practical-Statistics/2017/03/03/fixed-mixed-and-random-effects/
+
+train_test_split <- function(dat, percent = .75) {
+  # Make training/testing data - convienience function
+
+  n <- floor(nrow(dat) * percent)
+
+  dat$rn <- sample(nrow(dat), size = nrow(dat), replace = F)
+  dat <- dat[order(dat$rn), ]
+  train <- dat[1:n, ]
+  if (n == nrow(dat)) {
+    test <- train
+  } else {
+    test <- dat[(n + 1):nrow(dat), ]
+  }
+
+  out <- list(train = train, test = test)
+
+  return(out)
+}
+@
+
+This section walks though an example of our diagnostics. Because we found that each subset (i.e., subset with 34 or 30 countries) had similar residual and variance structures when using the full models with either total profit or agricultural profit as predicted variables, we focus on the agricultural profit predicted variable and the 30 country subset as it allows us to use the fullest model. There was also a very similar residual and variance structure between using per ha and per capita agricultural profit as a predictor, so we focus on the per ha data during this model specification phase. Since farm size actual, farm size relative, and the smallholder dummy cannot be in the same model due to multicollinearity, we use farm size actual and the other variables (i.e., female labor, family labor, and subsistence level) to show our exploration of the residuals and model fit. Again, through testing, we found that the three different farm size variables had similar influence on the main residual and variance structures; hence, using one of these variables at this stage will allow a cleaner exploration of model specification. Once we find a suitable model specification for this set of predictor variables on agricultural profit, we will apply a similar model to the other variable subsets and the total profit predicted variable and test diagnostics similar to what we outline here.
+
+We start by fitting a linear mixed effects model where country is a random effect (random slope) and log(farm size), female labor, family labor, and subsistence level are fixed effects predicting agricultural profit per ha. All predictors, except farm size are between 0 and 1 before we centered the means. The lmer formula is:
+
+agricultural income / ha ~ 
+log(landown) + female labor + family labor + subsistence + (1 | country) + (1 | country:psu)
+
+Before we begin, we standardize the variables by centering all the variables around their mean and dividing by their standard deviation.
+
+<<echo=F>>=
+standardize_dv <- function(dat, y = 'y',
+                           how = 'center and scale') {
+  
+  if (how == 'center') {
+      dat[[y]] <- dat[[y]] - abs(mean(dat[[y]], na.rm = T))
+    }
+    
+    if (how == 'center and scale') {
+        dat[[y]] <- (dat[[y]] - abs(mean(dat[[y]], na.rm = T))) /
+                      abs(sd(dat[[y]], na.rm = T))
+    }
+  
+  return(dat)
+}
+  
+standardize_ivs <- function(dat,
+                            how = 'center and scale') {
+  
+  ivs <- c('landown', 'rel_landown', 'rel_econsize', 
+           'p_femLab', 'p_famLab', 'p_subsist', 'p_rain')
+  
+  dat$landown <- log(dat$landown)
+  
+  for (iv in ivs) {
+    
+    if (iv %in% names(dat) & how == 'center') {
+          dat[[iv]] <- dat[[iv]] - abs(mean(dat[[iv]], na.rm = T))
+    }
+    
+    if (iv %in% names(dat) & how == 'center and scale') {
+          dat[[iv]] <- (dat[[iv]] - abs(mean(dat[[iv]], na.rm = T))) /
+                        abs(sd(dat[[iv]], na.rm = T))
+    }
+  }
+  
+  dat[['Farm Size (ha)']]  <- dat$landown
+  dat[['Farm Size (rel)']] <- dat$rel_landown
+  dat[['Female Labour']]   <- dat$p_femLab
+  dat[['Family Labour']]   <- dat$p_famLab
+  dat[['Subsistence']]     <- dat$p_subsist
+  dat[['Rainfed']]         <- dat$p_rain
+  dat[['Economic Size']]   <- dat$rel_econsize
+
+  return(dat)
+}
+@
+
+<<echo=F>>=
+# which use different formula syntax
+ivs <- 'rel_landown + p_femLab +  p_famLab + p_subsist + rel_econsize'
+
+# tmp1a and y variable for diagnostic
+tmp1 <- df_inc_pc
+tmp1$y <- tmp1$agrincome
+
+tmp1 <- tmp1[, c('id', 'country', 'y', 'dsmall',
+               'landown', 'rel_landown', 'p_femLab', 'p_famLab',
+               'p_subsist', 'rel_econsize')]
+tmp1 <- na.omit(tmp1)
+
+# Split train/tet tmp1a
+tmp1 <- train_test_split(tmp1, percent = .2)$train
+
+# center and scale ivs
+tmp1 <- standardize_ivs(tmp1)
+tmp1 <- standardize_dv(tmp1)
+
+# Add in weights
+tmp1 <- merge(tmp1, df_weights, by = 'id', all.x = T)
+
+# Diagnostic plot wrapper
+plot_mod <- function(mod, tmp_tmp1 = tmp1) {
+  par(mfrow = c(1,3))
+  qqnorm(resid(mod), main = 'QQ-plot, Deviance Residuals')
+  qqline(resid(mod))
+  
+  # qqnorm(ranef(mod)$country[,1],  main='QQ-plot, Random Effects (Countries)')
+  # qqline(ranef(mod)$country[,1])
+  
+  plot(resid(mod) ~ predict(mod), 
+       xlab = 'Fitted', ylab = 'Deviance Residuals',
+       main = 'Fitted v. Residuals') #residuals vs fitted
+  
+  abline(h=0, col = 'red')
+  
+  tmp_tmp1$f <- predict(mod)    #fitted vs observed
+  
+  plot(tmp_tmp1$f, jitter(tmp_tmp1$y, 0.1), 
+       xlab = 'Fitted', ylab = 'Observed',
+       main = paste('Fitted v. Observed'))
+  par(mfrow = c(1,1))
+}
+
+plot_resid_x <- function(mod, tmp_tmp1 = tmp1) {
+  par(mfrow = c(2,3))
+  plot(tmp_tmp1$landown, residuals(mod), 
+       xlab = 'Farm Size', ylab = 'Deviance Residuals')
+  abline(0,0, col = 'red')
+  plot(tmp_tmp1$p_femLab, residuals(mod), 
+       xlab = 'Female Labor', ylab = 'Deviance Residuals')
+  abline(0,0, col = 'red')
+  plot(tmp1$p_famLab, residuals(mod), xlab = 'Family Labor', ylab = 'Deviance Residuals')
+  abline(0,0, col = 'red')
+  plot(tmp_tmp1$p_subsist, residuals(mod), 
+       xlab = 'Subsistence', ylab = 'Deviance Residuals')
+  abline(0,0, col = 'red')
+  plot(tmp_tmp1$rel_econsize, residuals(mod), 
+       xlab = 'Subsistence', ylab = 'Deviance Residuals')
+  abline(0,0, col = 'red')
+  par(mfrow = c(1,1))
+}
+@
+
+<<fig.cap='Distributions of each variable.', out.width = '.95\\textwidth', size='footnotesize',fig.height=4, echo=F>>=
+par(mfrow = c(2,3))
+hist(tmp1$y, main = 'Agricultural Profit / capita')
+hist(tmp1$landown, main = 'Farm Size (rel)')
+hist(tmp1$p_femLab, main = 'Female Labor (%)')
+hist(tmp1$p_famLab, main = 'Family Labor (%)')
+hist(tmp1$p_subsist, main = 'Subsistence (%)')
+hist(tmp1$rel_econsize, main = 'Economic Size (rel)')
+par(mfrow = c(1,1))
+@
+
+Now, we run the random effects model and view diagnostic plots. We can see evidence of non-linear residuals in the tails.
+
+<<fig.cap='Linear random effect model diagnosis plots.', out.width = '.95\\textwidth', size='footnotesize',fig.height=3, echo=F>>=
+re <- lmer(as.formula(paste('y ~', ivs, '+ (1 | country) + (1 | country:psu)')), 
+           REML = F,
+           data = tmp1)
+plot_mod(re)
+@
+
+We look at the residual versus predictor variable plots and find there is structure in family labor especially.
+
+<<fig.cap='Linear random effect model diagnosis plots where each predictor variable is plotted against the residuals.', out.width = '.95\\textwidth', size='footnotesize',fig.height=4, echo=F>>=
+plot_resid_x(re)
+@
+
+We try logging agricultural profit though adding a constant than logging (to account for 0 values).
+
+<<fig.cap='Different transformations for the response varaible.', out.width = '.95\\textwidth', size='footnotesize',fig.height=2.5, echo=F>>=
+par(mfrow = c(1,2))
+tmp <- tmp1
+tmp$y1 <- log(tmp$y + abs(min(tmp$y)) + 1)  # make sure this puts it over 0
+hist(tmp$y, main = 'No Transform')
+hist(tmp$y1, main = 'Log Transform')
+par(mfrow = c(1,1))
+@
+
+We test if the log transform improves the model. The residuals become more normal in the upper and lower quartiles. The predictor versus residual plots remain similar to above.
+
+<<fig.cap='Linear random effect model diagnosis plots. Response variable logged', out.width = '.95\\textwidth', size='footnotesize',fig.height=3, echo=F>>=
+re_logy <- lmer(as.formula(paste('y1 ~', ivs,
+                                 '+ (1 | country) + (1 | country:psu)')), 
+                REML = F,
+                data = tmp)
+plot_mod(re_logy, tmp_tmp1 = tmp)
+@
+
+We compare the models through an anova test using the log-likelihood. We can see there is significant improvement with the logged response.
+
+<<echo=F>>=
+t <- as.data.frame(anova(update(re, data = tmp), re_logy))
+rownames(t) <- c('Non-logged response', 'Logged response')
+options(xtable.sanitize.text.function = identity)
+print(xtable(t),
+      include.rownames = T, size = '\\fontsize{6pt}{7pt}\\selectfont')
+@
+
+We test if using the survey sample weights (which we normalized from 0 to 1 to be comparable across countries) in a weighted linear mixed effects model will help the residual fit; this has an added benefit of correcting for sampling biases within a country and should be used if the model meets our diagnostic criteria. We can see that the lower residual tail still exists but those are where the higher sample weights are. This indicates that we should give more weight for the lower tail and keep the weights.
+
+<<fig.cap='Linear random effect model with survey sample weights diagnosis plots.', out.width = '.95\\textwidth', size='footnotesize',fig.height=3, echo=F>>=
+re_w <- lmer(as.formula(paste('y1 ~', ivs,
+                              '+ (1 | country) + (1 | country:psu)')), 
+           REML = F,
+           weights = weight_hh_adj,
+           data = tmp)
+
+tmp$r <- residuals(re_w)
+tmp$f <- fitted(re_w)
+# #TODO: debug following
+# qq <- function(obj, type = c("resid", "ranef"), title="",
+#                multiply.weights=FALSE) {
+#     type <- match.arg(type)
+#     val0 <- switch(type,
+#                   resid = list(resid = data.frame(resid=resid(obj))),
+#                   ranef = ranef(obj))
+#     ord0 <- numeric(0)
+#     for (level in names(val0)) {
+#         val1 <- val0[[level]]
+#         for (col in colnames(val1)) {
+#             val <- val1[[col]]
+#             ord <- order(val)
+#             name <- if (ncol(val1) == 1) level else paste(level, col, sep="/")
+#             data <- data.frame(level = name,
+#                                sample = val[ord],
+#                                theoretical = qnorm(ppoints(length(val))))
+#             data0 <- if (exists("data0")) rbind(data0, data) else data
+#             ord0 <- c(ord0, length(ord0) + ord)
+#         }
+#     }
+#     data0$weights <- obj@frame$`(weights)`
+# 
+#     plt <- ggplot(data0, aes(theoretical, sample))
+#     plt <- plt + geom_point(aes(color = weights))
+#     if (length(levels(data0$level)) > 1) plt + facet_wrap(~ level) else plt
+# }
+# 
+# plot_grid(
+#   qq(re_w),
+#   ggplot(tmp, aes(f,r,color=weight_hh_adj)) + geom_point(),
+#   ncol = 2)
+@
+
+We compare the logged weighted and non-weighted models through an anova test using the log-likelihood. We can see there is no significant improvement with the logged response, but again, for theoretical reasons (e.g., adjusting for national level sampling biases) we keep the weights.
+
+<<echo=F>>=
+t <- as.data.frame(anova(re_logy, re_w))
+rownames(t) <- c('Non-weighted', 'Weighted')
+options(xtable.sanitize.text.function = identity)
+print(xtable(t),
+      include.rownames = T, size = '\\fontsize{6pt}{7pt}\\selectfont')
+@
+
+We try to remedy the non-normality issues with a robust mixed model, which down-weights non-normal and non-constant 'contamination' at all levels of a mixed model; hence, we cannot use our sample survey weights. We can see the found weights and their placement in the residual quantiles and variance dispersion plots. This step is mainly to see if our results are robust using a Huber estimation procedure. If they are similar to the survey sample results, we will use the survey sample results because of theoretical reasons and because the robust mixed models are very computationally expensive to run on a data1set of this size.
+
+We can see that the robust model weighs the middle residuals, compared to the lower tail as when using the sample residuals.
+
+<<fig.cap='Robust linear random effect model diagnosis plots.', out.width = '.95\\textwidth', size='footnotesize',fig.height=3, echo=F>>=
+re_r <- rlmerRcpp(as.formula(paste('y1 ~', ivs,
+                                   '+ (1 | country)  + (1 | country:psu)')), 
+                  data = tmp)
+
+plot_grid(plot(re_r)[[2]] + theme(plot.title = element_text(size = 7)), 
+          plot(re_r)[[3]] + theme(plot.title = element_text(size = 7)), 
+          plot(re_r)[[1]] + theme(plot.title = element_text(size = 7)), 
+          ncol = 3)
+@
+
+While there are no log-likelihood methods implemented for robust mixed models, we compare the coefficients and standard errors between the robust and sample weight models. We can see similar coefficients and the robust residuals are smaller than the sample survey weighted standard errors. This can be interpreted as the sample survey standard errors as being more conservative estimates. We continue to use our sample survey weights with the logged response. 
+
+We also compare a weighted fixed effects model (with and without the Sandwich covariance correction; a correction used to deal with heteroskedasticity) with the results to understand if our choice of random over fixed effects model would change the results. We find no difference between the interpretation across the model types. 
+
+<<echo=F>>=
+tmp$c_p <- paste0(tmp$country, tmp$psu)
+fe <- lm(as.formula(paste('y1 ~', ivs, '-1 + c_p')), 
+         weights = weight_hh_adj,
+         data = tmp)
+
+re_w_s <- as.data.frame(summary(re_w)$coefficients)
+re_r_s <- as.data.frame(summary(re_r)$coefficients)
+fe_s <- as.data.frame(summary(fe)$coefficients)[1:5,1:3]
+fe_s_s <- data.frame(coeftest(fe, vcov = sandwich)[1:5,1:3])
+
+re_w_s$Variable <- rownames(re_w_s)
+re_r_s$Variable <- rownames(re_r_s)
+fe_s$Variable <- rownames(fe_s)
+fe_s_s$Variable <- rownames(fe_s_s)
+
+re_w_s$m <- 'RE - Weighted'
+re_r_s$m <- 'RE - Robust'
+fe_s$m <- 'FE'
+fe_s_s$m <- 'FE - Sandwich'
+colnames(fe_s_s) <- colnames(fe_s)
+
+t <- rbind(re_w_s, re_r_s, fe_s, fe_s_s)
+options(xtable.sanitize.text.function = identity)
+print(xtable(dcast(t, Variable ~ m, value.var = 'Estimate'),
+             digits = 4,
+             caption = 'Comparison of coefficients across models'),
+      include.rownames = F, size = '\\fontsize{6pt}{7pt}\\selectfont')
+@
+<<echo=F>>=
+print(xtable(dcast(t, Variable ~ m, value.var = 'Std. Error'),
+             digits = 4,
+             caption = 'Comparison of standard errors across models'),
+      include.rownames = F, size = '\\fontsize{6pt}{7pt}\\selectfont')
+@
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\subsection{Fitting Models}
+
+From our model diagnostics, we decided that the sample survey weighted mixed model was the most appropriate choice. We tested this on all outcome variables (i.e., relative and actual agricultural and total profit) and all data subset groups. In all cases, we found that the response variable benefited from a log transformation.
+
+In this section, we fit all final models with the full dataset and perform a bootstrap routine for all final models (subset groups 1 to 3, and actual and relative incomes). In each model subset we run single term models and the full models; all independent variables are centered around their mean and standardized on the standard deviation scale (i.e., (value - mean) / sd) so the coefficients' magnitude and direction of their effects can be directly compared to each other.
+
+<<echo=F>>=
+# Clean up environment before main analysis to save memory
+keep_vars <-  c('df_weights', 
+                'df_inc_ha', 'df_inc_pc',
+                'p_df_inc_ha', 'p_df_inc_pc',
+                'train_test_split', 'standardize_ivs',
+                'standardize_dv',
+                'map_world', 'packages',
+                'startTime', 'satargazer_type')
+ln <- length(ls()) - length(keep_vars)
+rm(list = ls()[!ls() %in% keep_vars])
+@
+
+
+<<echo=F>>=
+train_lmer <- function(dat, y = 'agrincome', percent = .1, logy = T) {
+
+  # print('Prep Data')
+
+  dat$y <- dat[[y]]
+
+  # For latter plot labeling ease
+  dat$y_name <- y
+  
+  # Log y
+  if (logy == T) {
+    dat$y <- log(dat$y + abs(min(dat$y, na.rm = T)) + 1)
+  }
+  
+  # Add in weights
+  # Add in weights
+  dat <- merge(dat, df_weights, by = 'id', all.x = T)
+
+  # print('Subset Data')
+  ####################################################
+  # Subgroups
+  ####################################################
+  # Subgroup 1 models
+  dat1 <- dat[, c('id', 'psu',
+                  'country', 'weight_hh_adj',
+                  'y', 'y_name',
+                  'landown',
+                  'rel_landown',
+                  'rel_econsize',
+                  'p_femLab')]
+
+  dat1 <- na.omit(dat1)
+  
+  # Center and scale ivs and dv
+  dat1 <- standardize_ivs(dat1)
+  dat1 <- standardize_dv(dat1)
+  
+  # Split train/tet data
+  dat1 <- train_test_split(dat1, percent = percent)
+
+  ####################################################
+  # Subgroup 2 models
+  dat2 <- dat[c('id', 'psu',
+                'country', 'weight_hh_adj',
+                'y', 'y_name',
+                'landown',
+                'rel_landown',
+                'rel_econsize',
+                'p_femLab',
+                'p_famLab',
+                'p_subsist')]
+
+  dat2 <- na.omit(dat2)
+
+  # Center and scale ivs and dv
+  dat2 <- standardize_ivs(dat2)
+  dat2 <- standardize_dv(dat2)
+  
+  # Split train/test data
+  dat2 <- train_test_split(dat2, percent = percent)
+  
+  ####################################################
+  # Subgroup 3 models
+  dat3 <- dat[c('id', 'psu',
+                'country', 'weight_hh_adj',
+                'y', 'y_name',
+                'landown',
+                'rel_landown',
+                'rel_econsize',
+                'p_femLab',
+                'p_famLab',
+                'p_subsist',
+                'p_rain')]
+
+  dat3 <- na.omit(dat3)
+
+  # Center and scale ivs and dv
+  dat3 <- standardize_ivs(dat3)
+  dat3 <- standardize_dv(dat3)
+
+  # Split train/test data
+  dat3 <- train_test_split(dat3, percent = percent)
+  
+  # print('Models - Subset 1')
+  ####################################################
+  # Random Effects
+  ####################################################
+  # Subgroup 1 models
+  re_1_1 <- lmer(y ~ `Farm Size (ha)` +
+                      `Economic Size` +
+                      `Female Labour` +
+                   (1 | country) + (1 | country:psu),
+                 weights = weight_hh_adj,
+                 dat1$train)
+
+  re_1_2 <- lmer(y ~ `Farm Size (rel)` +
+                      `Economic Size` +
+                      `Female Labour` +
+                   (1 | country) + (1 | country:psu),
+                 weights = weight_hh_adj,
+                 dat1$train)
+
+  re_1_3 <- lmer(y ~ `Farm Size (ha)` +
+                   (1 | country) + (1 | country:psu),
+                 weights = weight_hh_adj,
+                 dat1$train)
+
+  re_1_4 <- lmer(y ~ `Farm Size (rel)` +
+                  (1 | country) + (1 | country:psu),
+                 weights = weight_hh_adj,
+                dat1$train)
+  
+  re_1_5 <- lmer(y ~ `Economic Size` +
+                  (1 | country) + (1 | country:psu),
+                 weights = weight_hh_adj,
+                dat1$train)
+
+  re_1_6 <- lmer(y ~ `Female Labour` +
+                  (1 | country) + (1 | country:psu),
+                 weights = weight_hh_adj,
+                dat1$train)
+
+  
+  # print('Models - Subset 2')
+  ####################################################
+  # Subgroup 2 models
+  re_2_1 <- update(re_1_1, . ~ . + 
+                     `Family Labour` +
+                     `Subsistence`,
+                   weights = weight_hh_adj,
+                   data = dat2$train)
+  
+  re_2_2 <- update(re_1_2, . ~ . + 
+                     `Family Labour` +
+                     `Subsistence`,
+                   weights = weight_hh_adj,
+                   data = dat2$train)
+  
+  re_2_3 <- update(re_1_3, data = dat2$train, weights = weight_hh_adj)
+  re_2_4 <- update(re_1_4, data = dat2$train, weights = weight_hh_adj)
+  re_2_5 <- update(re_1_5, data = dat2$train, weights = weight_hh_adj)
+  re_2_6 <- update(re_1_6, data = dat2$train, weights = weight_hh_adj)
+  
+  re_2_7 <- lmer(y ~ `Family Labour` +
+                  (1 | country) + (1 | country:psu),
+                 weights = weight_hh_adj,
+                dat2$train)
+  
+  re_2_8 <- lmer(y ~ `Subsistence` +
+                  (1 | country) + (1 | country:psu),
+                 weights = weight_hh_adj,
+                dat2$train)
+  
+  
+  # print('Models - Subset 3')
+  ####################################################
+  # Subgroup 3 models
+  re_3_1 <- update(re_2_1, . ~ . + 
+                     `Rainfed`,
+                   weights = weight_hh_adj,
+                   data = dat3$train)
+  
+  re_3_2 <- update(re_2_2, . ~ . + 
+                     `Rainfed`,
+                   weights = weight_hh_adj,
+                   data = dat3$train)
+  
+  re_3_3 <- update(re_2_3, data = dat3$train, weights = weight_hh_adj)
+  re_3_4 <- update(re_2_4, data = dat3$train, weights = weight_hh_adj)
+  re_3_5 <- update(re_2_5, data = dat3$train, weights = weight_hh_adj)
+  re_3_6 <- update(re_2_6, data = dat3$train, weights = weight_hh_adj)
+  re_3_7 <- update(re_2_7, data = dat3$train, weights = weight_hh_adj)
+  re_3_8 <- update(re_2_8, data = dat3$train, weights = weight_hh_adj)
+  
+  re_3_9 <- lmer(y ~ `Rainfed` +
+                  (1 | country) + (1 | country:psu),
+                 weights = weight_hh_adj,
+                dat3$train)
+  
+  
+  # print('Saving Models')
+  ####################################################
+  # Save models
+  out <- list()
+  
+  for (i in 1:3) {
+    if (i == 1) {j = 6}
+    if (i == 2) {j = 8}
+    if (i == 3) {j = 9}
+    for (k in 1:j) {
+      mod_name <- paste0('re_', i, '_', k)
+      out[[mod_name]] <- get(mod_name)
+    }
+  }
+  
+  if (percent < 1) {
+    out[['test1']] <- dat1$test
+    out[['test2']] <- dat2$test
+    out[['test3']] <- dat3$test
+  }
+
+  return(out)
+}
+
+train_all_models <- function(percent = .5) {
+  
+  ivs <- c('agrincome', 'totincome')
+  income_types <- c('p_df_inc_', 'df_inc_') # p is relative, non p is actual
+  denominators <- c('ha', 'pc')
+  
+  out = list()
+  
+  for (income_type in income_types) {
+    for (denominator in denominators) {
+      
+      tmp <- get(paste0(income_type, denominator))
+      
+      for (iv in ivs) {
+        if (income_type == 'actual' & denominator == 'ha') {
+          logy = T
+        } else{
+          logy = F
+        }
+        mod <- train_lmer(tmp,
+                          y = iv, 
+                          percent = percent, 
+                          logy = logy)
+        
+        out[[paste0(income_type, denominator, '_', iv)]] <- mod
+      }
+    }
+  }
+  return (out)
+}
+
+all_mods <- train_all_models(percent = .01)
+@
+
+<<echo=F>>=
+# # TODO (nix the custom bstrap and use confint; ivs are in same units now and can be dir compared)
+# 
+# Here are the slopes and bootstrapped confidence intervals for each dimension of smallholder per model. In this plot we can see that the slopes for farm size (both actual and relative) switched direction when the output variable was per ha or per capita. We found smaller farms (negative coefficient) to have higher on-farm profit per ha but lower on-farm profits per capita. This suggests that while smaller farms are more productive, farmers with smaller farms are poorer. This result remains when we incorporate total (on and off-farm) profit per capita.
+# 
+# <<fig.cap='Slopes and bootstrapped confidence intervals for each dimension of smallholder per model. The verical black line is zero, where coefficients to the left are negative and coefficients to the right are positive.', out.width='1\\linewidth', fig.height=4.5, fig.width=6, size='footnotesize', echo=F>>=
+# # Set up function to extract coefs and ses
+@
+
+<<echo=F>>=
+extract_coefs_ses <- function(all_modsin,
+                              iv = 'agrincome',
+                              income_type = 'p_df_inc_',
+                              denominator = 'ha',
+                              i = 1,
+                              j = 1
+                              ) {
+
+  # Define model name
+  mod_list <- paste0(income_type, denominator, '_', iv)
+  mod_name <- paste0('re_', i, '_', j)
+  mod <- all_modsin[[mod_list]][[mod_name]]
+
+  # Extract relevant variables
+  s <- as.data.frame(
+    summary(mod)$coefficients[,1])
+  s$variable = rownames(s)
+  colnames(s) <- c('coef', 'variable')
+  cis <- as.data.frame(confint(mod, method = 'boot'))
+  cis$variable = rownames(cis)
+  colnames(cis) <- c('ci_l', 'ci_u', 'variable')
+  s <- merge(s, cis, by = 'variable', all.x = T, all.y = F)
+  s$iv <- iv
+  s$income_type <- income_type
+  s$denominator <- denominator
+  s$subgroup <- i
+  s$model_no <- j
+  s$model_name <- mod_name
+
+  return(s)
+}
+
+bootstrap_cis <- function(all_models = all_mods) {
+
+  # Set up empty df to loop into
+  out_ci <- data.frame(
+    iv = NA,
+    income_type = NA,
+    denominator = NA,
+    subgroup = NA,
+    model_no = NA,
+    model_name = NA,
+    variable = NA,
+    coef = NA,
+    ci_u = NA,
+    ci_l = NA)
+
+  # define looped variables
+  ivs <- c('agrincome', 'totincome')
+  income_types <- c('p_df_inc_', 'df_inc_') # p is relative, non p is actual
+  denominators <- c('ha', 'pc')
+
+  # Loop through variables and extract coefs and ses
+  for (iv in ivs) {
+    for (income_type in income_types) {
+      for (denominator in denominators) {
+
+        for (i in 1:3) {
+          for (j in 1:2) {
+
+            # Place into main df
+            out_ci <- rbind(out_ci,
+                            extract_coefs_ses(all_modsin = all_models,
+                                              iv, income_type,
+                                              denominator, i, j))
+          }
+        }
+      }
+    }
+  }
+  return(out_ci)
+}
+
+out_ci <- bootstrap_cis()
+@
+
+From the final models, we see 4 key take aways. 
+\begin{enumerate}
+  \item Per ha profit (both on and off-farm) also shows farm size (in both relative and actual terms) as a more important than the other variables, where smaller farms have higher per ha profits.
+  \item Per person profit (both on and off-farm) show the opposite relationship with farm size, where increases in farm size related to increases in per person profit.
+  \item Economic size moderates the farm size to pofit per person relationship. Once, controlled for, the farm size to profit relationship is no longer significant or the sign flips to a weak negative relationship.
+  \item Economic size of a farm is the most important predictor across all models - where increases of economic size explain increases in per ha and per person profits.
+  \item Per person on-farm profits show farm size (in both relative and actual terms) and female labor as more important variables than the other variables, where both had a negative relationship with profits per person.
+  \item Per person total profits show female labor and subsistence farms as more important variables than the other variables, where both had a negative relationship with profits per person.
+\end{enumerate}
+
+
+The following table shows how the farm size to profit per ha relationship is robust to other dimensions of smallholder and the farm size to profit per person relationship is moderated by economic size. Since the two subsets and the relative or actual profits showed similar results, we present subset 2 with relative profits as we can test how all variables do or do not moderate the farm size to profit relationships.
+
+<<echo=F>>=
+mod_fs_ha_all <- all_mods$p_df_inc_ha_agrincome$re_2_1
+mod_fs_ha_fam <- update(mod_fs_ha_all, 
+                        . ~ . - `Economic Size` - `Family Labour` - `Subsistence`)
+mod_fs_ha_fem <- update(mod_fs_ha_all, 
+                        . ~ . - `Economic Size` - `Female Labour` - `Subsistence`)
+mod_fs_ha_sub <- update(mod_fs_ha_all,
+                        . ~ . - `Female Labour` - `Family Labour` - `Economic Size`)
+mod_fs_ha_eco <- update(mod_fs_ha_all,
+                        . ~ . - `Female Labour` - `Family Labour` - `Subsistence`)
+mod_fs_ha <- update(mod_fs_ha_all, 
+                    . ~ . - `Economic Size` - `Female Labour` - `Family Labour` - `Subsistence`)
+stargazer(mod_fs_ha, mod_fs_ha_fem, mod_fs_ha_fam,
+          mod_fs_ha_sub, mod_fs_ha_eco, mod_fs_ha_all,
+          dep.var.labels = 'On-Farm Profit / Ha in Relative Terms', type = 'text')
+@
+
+Economic size strongly moderates the farm size (ha) to profit per person relationship for on-farm profit per person in real and relative terms, and for total profit per person in relative terms. It does not moderate the relationship as strongly for real totincome, although a much weaker relationship (average effect without economic size = 0.112 (SE = 0.005; p < 0.01); average effect with economic size = 0.012 (SE = 0.005; p < 0.05)). In addition, the BIC indicates a better fit with economic size (BIC = 103,401), compared to without economic size (BIC = 105,892). We found very similar results for the farm size in relative terms relationships.
+
+<<echo=F>>=
+mod_fs_pc_all <- all_mods$p_df_inc_pc_agrincome$re_2_1
+mod_fs_pc_fam <- update(mod_fs_pc_all, 
+                        . ~ . - `Economic Size` - `Family Labour` - `Subsistence`)
+mod_fs_pc_fem <- update(mod_fs_pc_all, 
+                        . ~ . - `Economic Size` - `Female Labour` - `Subsistence`)
+mod_fs_pc_sub <- update(mod_fs_pc_all,
+                        . ~ . - `Female Labour` - `Family Labour` - `Economic Size`)
+mod_fs_pc_eco <- update(mod_fs_pc_all,
+                        . ~ . - `Female Labour` - `Family Labour` - `Subsistence`)
+mod_fs_pc <- update(mod_fs_pc_all, 
+                    . ~ . - `Economic Size` - `Female Labour` - `Family Labour` - `Subsistence`)
+stargazer(mod_fs_pc, mod_fs_pc_fem, mod_fs_pc_fam,
+          mod_fs_pc_sub, mod_fs_pc_eco, mod_fs_pc_all,
+          dep.var.labels = 'On-Farm Profit / Person in Relative Terms')
+@
+
+
+In addition, the different subgroups (using 34 versus 30 countries) and using either actual or relative farm size did not have an effect on the conclusions.
+
+<<fig.cap='Final Models slope and 95 percent confidence intervals (CI).', out.width = '.95\\textwidth', size='footnotesize',fig.height=4, echo=F>>=
+tmp <- out_ci
+tmp$variable <- str_replace(tmp$variable, '`', '')
+tmp$variable <- str_replace(tmp$variable, '`', '')
+tmp$variable <- str_replace(tmp$variable, '\\(I', 'I')
+tmp$variable <- str_replace(tmp$variable, 't\\)', 't')
+tmp$iv <- ifelse(tmp$iv == 'agrincome', 'On-Farm Profit', 'Total Profit')
+tmp$income_type <- ifelse(tmp$income_type == 'p_df_inc_', 'Relative', 'Actual')
+tmp$denominator <- ifelse(tmp$denominator == 'ha', 'Per ha', 'Per person')
+tmp$Model <- ifelse(tmp$model_no == 1, 
+                       'All variable with farm size (ha)', 
+                       'All variable with farm size (rel)')
+tmp$Subgroup <- factor(tmp$subgroup)
+tmp <- na.omit(tmp)
+
+tmp <- tmp %>% filter(variable != 'Intercept' &
+                      # variable!='Economic Size' &
+                      # income_type == 'Relative' &
+                      # iv == 'All Income' & Subgroup == 2 &
+                      Subgroup != 3)
+
+p1 <- ggplot(tmp, aes(x = variable, color = Model, shape = Subgroup)) +
+    geom_linerange(aes(ymin = ci_l,
+                       ymax = ci_u),
+                   position = position_dodge(width = .3)) +
+    geom_point(aes(y = coef),
+               position = position_dodge(width = .3), 
+               size = 3) +
+    coord_flip() +
+    facet_grid(iv + income_type ~ denominator, 
+               margins = F,
+               scales = 'free') +
+    xlab('') +
+    ylab('Slope and 95 CI') +
+    geom_hline(aes(yintercept = 0), linetype = 'dashed') +
+    # geom_hline(aes(yintercept = 0), color = 'black', size = .5) +
+    # geom_vline(aes(xintercept = 6.5), color = 'grey80', size = .5) +
+    # scale_color_brewer(name = 'Dependent Variable(s)',
+    #                    palette = 'Set2') +
+    theme(axis.text = element_text(size = 7),
+          text = element_text(size = 7),
+          # panel.spacing = unit(2, 'lines'),
+          panel.grid.minor.y = element_line(color = 'grey80'),
+          legend.position = 'bottom',
+          legend.text = element_text(size = 6),
+          legend.title = element_text(size = 6),
+          legend.justification = 'center')
+
+p1 + theme(axis.text = element_text(size = 12),
+          text = element_text(size = 12),
+          panel.border = element_rect(fill = NA, 
+                                      linetype = 'solid',
+                                      color = 'grey50', 
+                                      size = 1),
+          axis.line.x = element_line(color = 'grey50',
+                                    size = 1),
+          axis.line.y = element_line(color = 'grey50',
+                                    size = 1),
+          # panel.spacing = unit(2, 'lines'),
+          strip.background = element_rect(fill = 'grey80'))
+          # strip.text.y = element_text(angle = 0))
+# ggsave('figures_manuscript/Figure_3b.png')
+@
+
+Here we show the country level differences in our results. We need to fit updated models where we model the slope and intercept per country to be able to show the country level relationships per smallholder dimension. For brevity, we update the subgroup 2 models with relative farm size and relative total incomes as most models show similar results and this subgroup contains all variables of interest. 
+
+<<fig.cap='Final models mean effect per country.', out.width = '.95\\textwidth', size='footnotesize',fig.height=4.5, echo=F>>=
+plot_map_coefs <- function(mod, legend = F, 
+                           variable = 'variable', 
+                           title = '') {
+  
+  dat <- mod@frame
+  dat$new_var <- dat[[variable]]
+  
+  new <- update(mod, . ~ . + (new_var | country), 
+                weights = `(weights)`,
+                data = dat)
+  
+  dat <- data.frame(
+    Relationship = coef(new)$country$new_var +
+      coef(new)$country$`(Intercept)`,
+    region = rownames(coef(new)$country))
+  
+  lim <- max(abs(dat$Relationship))
+  
+  map_world2 <- full_join(map_world, dat, by = 'region')
+  
+  p1 <- ggplot() +
+      geom_polygon(data = map_world2,
+                aes(x = long,
+                    y = lat,
+                    fill = Relationship,
+                    group = group),
+                   color = 'white',
+                   size  = .1) + 
+      scale_fill_distiller(palette = 'RdYlGn',
+                           na.value = 'grey75',
+                           direction = 1,
+                           limits = c(-1.5, 1.5)) +
+      labs(title = '') +
+      theme_void() +
+      theme(legend.key.width = unit(.15, 'cm'),
+            legend.text = element_text(size = 5),
+            legend.title = element_blank(),
+            plot.title = element_text(hjust = 0.5,
+                                      size = 7)) +
+      coord_fixed() +
+      coord_proj('+proj=robin +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs') +
+      ggtitle(title)
+  
+  if (legend == T) {
+    p1 <- p1 + theme(legend.position = c(0.1,0.5))
+  } else {
+    p1 <- p1 + theme(legend.position = 'none')
+  }
+
+  return(p1)
+}
+
+ms <- c(all_mods$p_df_inc_ha_totincome$re_2_2,
+        all_mods$p_df_inc_pc_totincome$re_2_2,
+        all_mods$p_df_inc_ha_agrincome$re_2_2,
+        all_mods$p_df_inc_pc_totincome$re_2_2)
+ds <- c('All Profit / ha',
+        'All Profit / perspn',
+        'On-Farm Profit / ha',
+        'On-Farm Profit / perspn')
+vs <- c('Farm Size (rel)', 'Economic Size', 
+        'Female Labour', 'Family Labour', 
+        'Subsistence')
+
+plot_list <- list()
+
+i = 1
+for (m in 1:length(ms)) {
+  for (v in vs) {
+    if (i == 1) {
+      p1 <- plot_map_coefs(ms[[m]], 
+                           variable = v, 
+                           title = paste0(ds[[m]],'\n',v),
+                           legend = T)
+    } else {
+      p1 <- plot_map_coefs(ms[[m]], 
+                           variable = v, 
+                           title = paste0(ds[[m]],'\n',v),
+                           legend = F)
+    }
+    plot_list[[paste0('p',i)]] <- p1 + 
+      theme(plot.margin = unit(c(0,0,0,0), 'cm'))
+    i = 1 + i
+  }
+}
+
+margin <- theme(plot.margin = unit(c(-.1,-1,-.1,-1), "cm"))
+grid.arrange(grobs = lapply(plot_list, "+", margin), ncol = 5)
+# ggsave('figures_manuscript/Figure_SI_5a.png')
+@
+
+<<echo=F>>=
+# %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+# %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+# %
+# % <<echo=F>>=
+# % # Playing with ANNs
+# % # finding - very similar results to lm,
+# % # Pro - non-parametric and lmer4 has
+# % # diagnostic issues in normal resids
+# % # that robustlmer cannot fix due to data size
+# % # Con - limited interpretation
+# % # since it forces interactions and
+# % # does not provide error estimates or
+# % # slopes parameters
+# %
+# % # Compare fit with fixed effects model
+# % # Prep data
+# % dat <- df_inc_pc
+# % dat$y <- log(dat$agrincome_adj)
+# % dat[['Farm Size (ha)']] <- log(dat$landown)
+# % dat[['Farm Size (rel)']] <- dat$rel_landown
+# % dat[['Family Labour']] <- dat$p_famLab
+# % dat[['Subsistence']] <- dat$p_subsist
+# %
+# % dat$y <- scale(dat$y)
+# % dat$`Farm Size (ha)` <- scale(dat$`Farm Size (ha)`)
+# % dat$`Farm Size (rel)` <- scale(dat$`Farm Size (rel)`)
+# % dat$`Family Labour` <- scale(dat$`Family Labour`)
+# % dat$`Subsistence` <- scale(dat$`Subsistence`)
+# %
+# % dat <- train_test_split(dat, percent = .75)
+# %
+# % # Make lm fixed effect model to compare ANN to
+# % lmod <- lm(y ~ `Farm Size (ha)` +
+# %                        `Family Labour` +
+# %                        `Subsistence` +
+# %                         country,
+# %            dat$train)
+# % summary(lmod)
+# %
+# % # ANN
+# % library(nnet)
+# %
+# % # Full code - needs to be paralelled (see below)
+# % bestrss1 <- 10000
+# % bestrss2 <- 10000
+# % bestrss3 <- 10000
+# % bestrss4 <- 10000
+# % bestrss5 <- 10000
+# % bestrss6 <- 10000
+# %
+# % j = 2
+# % for (i in 1:10) {
+# %   # for (j in seq(2,6,2)) {
+# %
+# %     nnmod1 <- nnet(y ~ `Farm Size (ha)` +
+# %                         country,
+# %                    dat$train,
+# %                    size = j,
+# %                    linout = T,
+# %                    # decay = .001,
+# %                    trace = F)
+# %
+# %     nnmod2 <- nnet(y ~ `Farm Size (rel)` +
+# %                         country,
+# %                    dat$train,
+# %                    size = j,
+# %                    linout = T,
+# %                    # decay = .001,
+# %                    trace = F)
+# %
+# %     nnmod3 <- nnet(y ~ `Family Labour` +
+# %                         country,
+# %                    dat$train,
+# %                    size = j,
+# %                    linout = T,
+# %                    # decay = .001,
+# %                    trace = F)
+# %
+# %     nnmod4 <- nnet(y ~ `Subsistence` +
+# %                         country,
+# %                    dat$train,
+# %                    size = j,
+# %                    linout = T,
+# %                    # decay = .001,
+# %                    trace = F)
+# %
+# %     nnmod5 <- nnet(y ~ `Farm Size (ha)` +
+# %                        `Family Labour` +
+# %                        `Subsistence` +
+# %                         country,
+# %                    dat$train,
+# %                    size = j,
+# %                    linout = T,
+# %                    # decay = .001,
+# %                    trace = F)
+# %
+# %     nnmod6 <- nnet(y ~ `Farm Size (rel)` +
+# %                        `Family Labour` +
+# %                        `Subsistence` +
+# %                         country,
+# %                    dat$train,
+# %                    size = j,
+# %                    linout = T,
+# %                    # decay = .001,
+# %                    trace = F)
+# %
+# %     cat(i, j, '\n')
+# %
+# %     if (nnmod1$value > bestrss1) {
+# %       bestnn1 <- nnmod1
+# %       bestrss1 <- nnmod1$value
+# %     }
+# %
+# %     if (nnmod2$value > bestrss2) {
+# %       bestnn2 <- nnmod2
+# %       bestrss2 <- nnmod2$value
+# %     }
+# %
+# %     if (nnmod3$value > bestrss3) {
+# %       bestnn3 <- nnmod3
+# %       bestrss3 <- nnmod3$value
+# %     }
+# %
+# %     if (nnmod4$value > bestrss4) {
+# %       bestnn4 <- nnmod4
+# %       bestrss4 <- nnmod4$value
+# %     }
+# %
+# %     if (nnmod5$value > bestrss5) {
+# %       bestnn5 <- nnmod5
+# %       bestrss5 <- nnmod5$value
+# %     }
+# %
+# %     if (nnmod6$value > bestrss6) {
+# %       bestnn6 <- nnmod6
+# %       bestrss6 <- nnmod6$value
+# %     }
+# %   }
+# % # }
+# %
+# % bestnn <- list(bestnn1 = bestnn1,
+# %                bestnn2 = bestnn2,
+# %                bestnn3 = bestnn3,
+# %                bestnn4 = bestnn4,
+# %                bestnn5 = bestnn5,
+# %                bestnn6 = bestnn6)
+# %
+# %
+# % for (i in 1:6) {
+# %   # Assess fit
+# %   # pseudo r2
+# %   r2 <- 1 - bestnn[[i]]$value / sum(
+# %     (dat$train$y -
+# %     mean(dat$train$y, na.rm = T))^2, na.rm = T)
+# %   cat(i, r2, '\n')
+# % }
+# %
+# % plot_ann <- function(dat_, var, nn_model) {
+# %
+# %   p <- ggplot() +
+# %     geom_point(aes(x = dat_[[var]],
+# %                    y = predict(nn_model, new = dat_)),
+# %                size = .2,
+# %                color = 'green') +
+# %     geom_point(aes(x = dat_[[var]],
+# %                    y = predict(lmod, new = dat_)),
+# %                color = 'purple',
+# %                size = .2) +
+# %     geom_smooth(aes(x = dat_[[var]],
+# %                     y = predict(nn_model, new = dat_),
+# %                     color = 'ANN'),
+# %                 method = 'lm',
+# %                 color = 'green') +
+# %     geom_smooth(aes(x = dat_[[var]],
+# %                     y = predict(lmod, new = dat_),
+# %                     color = 'LM'),
+# %                 method = 'lm',
+# %                 color = 'purple')
+# %   return(p)
+# % }
+# %
+# % plot_ann(dat$train, 'y', bestnn$bestnn5)
+@
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\section{Analysis - Defining Smallholders to Reach SDG 2.3 Target}
+\subsection{Overview}
+
+Now that we know how the different dimensions of smallholders map onto profit, we want to test the effectiveness of defining smallholders by each dimension. We are able to use the subgroup 2 from above (30 countries) for this portion of our analysis since they contain all variables in our analysis. We use total income in 2011 USD PPP values since we can use the national poverty lines to make the following analysis consistent with our relative income analysis above.
+
+SDG 2.3 seeks to double the productivity and incomes of smallholders by 2030 as a way to get farmers out of poverty. We double the profit (per capita) of all the households in our dataset and see which households were under the national poverty lines and now are above the poverty lines (Group A, hereafter); we also examine the farmers who are still not over the national poverty lines (Group B, hereafter). 
+
+We get our national poverty lines from Jolliffe and Prydz (2016 -
+"Estimating international poverty lines from comparable national thresholds"), which have national poverty lines in 2011 PPP dollar equivalents. Jolliffe and Prydz have national poverty lines for all countries in our dataset except: Bangladesh, Cambodia, Iraq, and Timor-Leste. For these four countries we set their national poverty line according to their World Bank national income classification (e.g., low income country) since Jolliffe and Prydz outline how the national income classifications map onto the global poverty thresholds (e.g., low income countries' poverty line is 1.90, while the lower middle countries' poverty line is 3.20). Cambodia and Bangladesh are considered low income, so we set their poverty line at 1.9. Iraq is considered upper-middle income, so we set their poverty line at 5.20. Timor-Leste is considered lower middle income, so we set their poverty line at 3.20. (See http://chartsbin.com/view/2438 for country classifications.)
+
+<<echo=F>>=
+# http://chartsbin.com/view/2438
+pov_lns <- read.csv('../data/national_poverty_lines.csv')
+c1 <- unique(pov_lns$country)
+c2 <- unique(df_inc_pc$country)
+
+missing <- data.frame(country = sort(c2[!c2 %in% c1]),
+                      poverty_line_2011_PPP = c(1.9,1.9,5.5,3.2))
+
+pov_lns <- rbind(pov_lns[,c(1,3)], missing)
+dat <- merge(df_inc_pc, pov_lns, by = 'country', all.x = T, all.y = F)
+dat <- merge(dat, df_weights, by = 'id', all.x = T, all.y = F)
+dat <- dat[c('id',
+             'hhsize',
+             'poverty_line_2011_PPP',
+             'totincome',
+             'country', 
+             'weight_hh',
+             'weight_hh_adj',
+             'landown',
+             'rel_landown',
+             'rel_econsize',
+             'p_femLab',
+             'p_famLab',
+             'p_subsist')]
+
+dat <- na.omit(dat)
+
+# Add in adjusted expansion factor based on percentages (hhsize * weight_hh_adj (weight is b/t 0 and 1 per country))
+# FLAG - not always a 1 to 1 correlation b/t hhweight * hhsize and expansion factor??
+dat$exp_adj <- dat$hhsize * dat$weight_hh
+@
+
+We double everyone's income and see who was under the national poverty line and is now over the national poverty line (Group A) or who is still under the national poverty line (Group B). We automatically label zero and negative values as group B because doubling zero and negative values results in zero and tripling the absolute value of negative numbers gives an unrealistic view of how many people transitioned out of poverty.
+
+<<echo=F>>=
+for (n in seq(1, 5, by = .05)) {
+  tmp <- dat %>% select(id, country, poverty_line_2011_PPP, 
+                        totincome, exp_adj)
+
+  tmp$totincome_nx <- ifelse(tmp$totincome > 0, tmp$totincome * n,
+                             tmp$totincome)
+  
+  tmp$subgroup <- ifelse(tmp$totincome    < tmp$poverty_line_2011_PPP &
+                         tmp$totincome_nx > tmp$poverty_line_2011_PPP, 
+                         'A',
+                   ifelse(tmp$totincome    < tmp$poverty_line_2011_PPP &
+                          tmp$totincome_nx < tmp$poverty_line_2011_PPP, 
+                          'B', 'C'))
+  
+  tmp <- tmp %>%
+    filter(subgroup != 'C') %>%
+    group_by(country) %>%
+    mutate(n_tot = sum(exp_adj)) %>%
+    group_by(country, subgroup) %>%
+    summarise(p = 100 * sum(exp_adj) / max(n_tot)) %>% 
+    mutate(n = n)
+  
+  if (n == 1) {
+    out <- tmp
+  } else {
+    out <- rbind(out, tmp)
+  }
+}
+@
+
+First, we look at if doubling incomes will get the majority of farmers out of poverty. We plot different scenarios where we double (or 1x or 3x, etc.) times everyone's income against the percent of households that were in poverty and would be out of poverty with the income increase. We see that at 2x the incomes, the percentage of people getting out of poverty is around 40 percent, at 3x it is 60 percent, and at 4x it is 70 percent.
+
+<<fig.cap="This plot shows the different scenarios where we double (or 1x or 3x, etc.) times everyone's income against the percent of households that were in poverty and would be out of poverty with the income increase. The 95 percent confidence intervals represents cross-country variation.", out.width = '.95\\textwidth', size='footnotesize',fig.height=3, echo=F>>=
+tmp <- out %>% filter(subgroup == 'A')
+p1 <- ggplot(tmp, aes(n, p)) + 
+  # geom_point() +
+  geom_smooth() +
+  xlab('N x Current Income') +
+  ylab('Percent Change') +
+  ggtitle('Percent change out of poverty') + 
+  xlim(1,5) +
+  theme(panel.grid.major = element_line(color = 'grey80'))
+p1
+@
+
+In order to understand where the slope of the line levels off, we calculate the derivative of the line. For the remainder of our analysis, we look at 2.1x incomes as this is close to the SDG 2.3 target and since there is not a large change after 2.1x incomes, there are not large gains and will not be a practical target. 
+
+<<fig.cap='This plot shows the derivative of the above plot. The 95 percent confidence intervals represents cross-country variation.', out.width = '.95\\textwidth', size='footnotesize',fig.height=3, echo=F>>=
+tmp2 <- out %>% filter(subgroup == 'A')
+tmp2$n1 <- tmp2$n
+tmp3 <- tmp2
+tmp3$n <- tmp3$n + .05
+tmp2 <- merge(tmp2, tmp3, 
+             by.x = c('subgroup', 'country', 'n'),
+             by.y = c('subgroup', 'country', 'n'),
+             all.x = T)
+tmp2$d <- tmp2$p.y / tmp2$p.x
+
+ggplot(tmp2, aes(n, d)) + 
+  geom_smooth() +
+  xlab('N x Current Income') +
+  ylab('Derivative') +
+  ggtitle('Derivative for percent change out of poverty') + 
+  xlim(1,5) +
+  theme(panel.grid.major = element_line(color = 'grey80'))
+@
+ 
+We now explore what types of farmers are in the group that was able to get out of poverty compared to those that are not able to get out of poverty when increasing the incomes by 2x.
+
+<<fig.cap='Boxplots of the types of farmers are in the group that was able to get out of poverty (Group A) compared to those that are not able to get out of poverty (Group B) when increasing the incomes by 2x and hose who were already not under the national poverty line (Group C).', out.width = '.95\\textwidth', size='footnotesize',fig.height=3, echo=F>>=
+# TODO: these arent adjusted by sampling weights or expansion factors - need to figure out.
+tmp <- dat
+n = 2
+tmp$totincome_nx <- ifelse(tmp$totincome >= 0, tmp$totincome * n,
+                           tmp$totincome + (abs(tmp$totincome) * (n-1)))
+  
+tmp$subgroup <- ifelse(tmp$totincome    < tmp$poverty_line_2011_PPP &
+                       tmp$totincome_nx > tmp$poverty_line_2011_PPP, 
+                       'A',
+                 ifelse(tmp$totincome    < tmp$poverty_line_2011_PPP &
+                        tmp$totincome_nx < tmp$poverty_line_2011_PPP, 
+                        'B', 'C'))
+
+tmp <- tmp %>% select(id, country, subgroup, exp_adj, 
+              landown, rel_landown, rel_econsize, 
+              p_femLab, p_famLab, p_subsist)
+tmp <- melt(tmp, id.vars = c('id', 'country', 'subgroup'))
+tmp$Subgroup <- tmp$subgroup
+
+ivs <- data.frame(variable = c('landown', 'rel_landown', 'rel_econsize',
+                                'p_femLab', 'p_famLab', 'p_subsist'),
+                  prop_names = c('Farm Size (ha)',
+                                 'Farm Size (rel)',
+                                 'Economic Size (rel)',
+                                 'Female Labor',
+                                 'Family Labor',
+                                 'Subsistence'))
+tmp <- merge(tmp, ivs, by = 'variable', all.x = T)
+tmp$variable <- tmp$prop_names
+
+fences <- tmp %>%
+  group_by(variable, Subgroup) %>%
+  summarise(ul = quantile(value)[4] + 1.5 * IQR(value),
+            ll = quantile(value)[4] + 1.5 * IQR(value))
+
+stats_ <- tmp %>%
+  group_by(variable, Subgroup) %>%
+  summarise(ymin = boxplot.stats(value)$stats[1],
+            lower = boxplot.stats(value)$stats[2],
+            middle = boxplot.stats(value)$stats[3],
+            upper = boxplot.stats(value)$stats[4],
+            ymax = boxplot.stats(value)$stats[5]) %>%
+  na.omit()
+
+
+ps1 <- ggplot(stats_, aes(x = Subgroup,
+                   fill = Subgroup,
+                   lower = lower,
+                   upper = upper,
+                   middle = middle,
+                   ymin = ymin,
+                   ymax = ymax)) +
+  geom_boxplot(stat = 'identity') +
+  labs(color = '') +
+  ylab('') +
+  xlab('') +
+  facet_wrap(~ variable, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle = 0, hjust = 1, size = 7),
+        axis.text.y = element_text(hjust = 1, size = 7),
+        axis.title = element_text(size = 9),
+        strip.text = element_text(size = 9))
+ps1
+# ggsave('figures_manuscript/Figure_SI_5.png', plot = ps1)
+@
+
+Relative farm size and relative economic size have the lowest thresholds equating to the most households that can get out of poverty, with levels of subsistence following these trends closely. Percent of a household's labor coming from female labor had a large jump at 50 percent, which indicates focusing on female dominant farms will be a useful target population. Focusing on the level of family labor does not alleviate many households of poverty until very high thresholds. 
+
+These results are similar to our regression analysis.
+
+<<fig.cap='This plot shows the percent of farmers that transition out of poverty if only smallholders’ incomes are doubled according to different thresholds (e.g., if we double the incomes of farmers on farms smaller than 40 percent of other farms in their country compared to another threshold, such as 60 percent). The extents of the lines are consistent with available data (e.g., family labor was heavily right skewed so there are few low threshold points, and farms did not always use family labor so the line does not meet the others at 40 percent). The 95 percent confidence intervals represents cross-country variation.', out.width = '.95\\textwidth', size='footnotesize',fig.height=4, echo=F>>=
+tmp <- dat %>% select(id, country, poverty_line_2011_PPP, exp_adj, 
+                      totincome, landown, rel_landown, rel_econsize,
+                      p_femLab, p_famLab, p_subsist)
+n = 2
+
+for (v in c('rel_landown', 'rel_econsize', 
+            'p_femLab', 'p_famLab', 'p_subsist')) {
+  
+  for (i in seq(0, 1, by = .01)) {
+    
+    tmp2 <- tmp
+    tmp2$totincome_nx <- ifelse(tmp[[v]] <= i & tmp2$totincome >= 0, 
+                                tmp2$totincome * n,
+                         ifelse(tmp[[v]] <= i & tmp2$totincome < 0,
+                                tmp2$totincome + (abs(tmp2$totincome) * (n-1)),
+                                tmp2$totincome))
+    
+    tmp2$subgroup <- ifelse(tmp2$totincome    < tmp2$poverty_line_2011_PPP &
+                            tmp2$totincome_nx > tmp2$poverty_line_2011_PPP, 
+                            'A',
+                     ifelse(tmp2$totincome    < tmp2$poverty_line_2011_PPP &
+                            tmp2$totincome_nx < tmp2$poverty_line_2011_PPP, 
+                            'B', 'C'))
+    
+    # tmp2 <- tmp2 %>%
+    #   filter(subgroup != 'C') %>%
+    #   mutate(n_tot = sum(exp_adj)) %>%
+    #   group_by(subgroup) %>% 
+    #   summarise(p = 100 * sum(exp_adj) / max(n_tot)) %>% 
+    #   mutate(i = i,
+    #          v = v)
+    
+    tmp2 <- tmp2 %>%
+      filter(subgroup != 'C') %>%
+      group_by(country) %>%
+      mutate(n_tot = sum(exp_adj)) %>%
+      group_by(country, subgroup) %>%
+      summarise(p = 100 * sum(exp_adj) / max(n_tot)) %>% 
+      mutate(i = i,
+             v = v)
+    
+    if (i == 0 & v == 'rel_landown') {
+      out <- tmp2
+    } else {
+      out <- rbind(out, tmp2)
+    }
+  }
+}
+
+out <- merge(out, ivs, by.x = 'v', by.y = 'variable', all.x = T)
+
+# Assign standard clors to each smallholder dim
+myColors <- rev(brewer.pal(6, 'Dark2'))
+names(myColors) <- levels(out$prop_names)
+colScale <- scale_colour_manual(values = myColors)
+
+p2 <- out %>% filter(subgroup == 'A') %>%
+ggplot(aes(i, p, color = prop_names)) + 
+  geom_smooth(alpha = .2) +
+  xlab('Threshold') +
+  ylab('Percent Change') +
+  ggtitle('Percent change out of poverty') +
+  colScale +
+  labs(colour = 'Smallholder Dimension')
+p2
+@
+
+As seen in the correlation plot in the previous section, different aspects of smallholders are not highly correlated with one another. Hence, if we use only one dimension (e.g., economic size) then we may miss key populations. 
+
+Here, we combine relative economic size with relative farm size, percent female labor, and percent subsistence, as economic size has been the most relevant to identify impoverished households and the other three variables were identified as highly relevant in both the regressions and the above analysis on thresholds.
+
+We can see that when combining relative economic size and relative farm size, we have the highest response curve.
+
+<<fig.cap='This plot shows if we combine relative economic size (the best predictor of per capita income from the above regression analysis) with each of the other key dimensions of smallholders we identified in the regression analysis: female labor, subsistence, and relative farm size. The 95 percent confidence intervals represents cross-country variation.',fig.height=3, echo=F>>=
+tmp <- dat %>% select(id, country, poverty_line_2011_PPP, exp_adj, 
+                      totincome, landown, rel_landown, rel_econsize,
+                      p_femLab, p_famLab, p_subsist)
+n = 2
+
+for (v in c('rel_landown', 'p_femLab', 'p_subsist')) {
+  
+  for (i in seq(0, 1, by = .01)) {
+    
+    tmp2 <- tmp
+    tmp2$totincome_nx <- ifelse(tmp[[v]] <= i & tmp[['rel_econsize']] <= i & tmp2$totincome >= 0, 
+                                tmp2$totincome * n,
+                         ifelse(tmp[[v]] <= i & tmp[['rel_econsize']] <= i & tmp2$totincome < 0,
+                                tmp2$totincome + (abs(tmp2$totincome) * (n-1)),
+                                tmp2$totincome))
+    
+    tmp2$subgroup <- ifelse(tmp2$totincome    < tmp2$poverty_line_2011_PPP &
+                            tmp2$totincome_nx > tmp2$poverty_line_2011_PPP, 
+                            'A',
+                     ifelse(tmp2$totincome    < tmp2$poverty_line_2011_PPP &
+                            tmp2$totincome_nx < tmp2$poverty_line_2011_PPP, 
+                            'B', 'C'))
+    
+    # tmp2 <- tmp2 %>%
+    #   filter(subgroup != 'C') %>%
+    #   mutate(n_tot = sum(exp_adj)) %>%
+    #   group_by(subgroup) %>% 
+    #   summarise(p = 100 * sum(exp_adj) / max(n_tot)) %>% 
+    #   mutate(i = i,
+    #          v = v)
+    # 
+    tmp2 <- tmp2 %>%
+      filter(subgroup != 'C') %>%
+      group_by(country) %>%
+      mutate(n_tot = sum(exp_adj)) %>%
+      group_by(country, subgroup) %>%
+      summarise(p = 100 * sum(exp_adj) / max(n_tot)) %>% 
+      mutate(i = i,
+             v = v)
+    
+    if (i == 0 & v == 'rel_landown') {
+      out <- tmp2
+    } else {
+      out <- rbind(out, tmp2)
+    }
+  }
+}
+
+out <- merge(out, ivs, by.x = 'v', by.y = 'variable', all.x = T)
+
+p3 <- out %>% filter(subgroup == 'A') %>%
+ggplot(aes(i, p, color = prop_names)) + 
+  geom_smooth(alpha = .2) +
+  xlab('Threshold') +
+  ylab('Percent Change') +
+  ggtitle('Percent change out of poverty') +
+  geom_vline(aes(xintercept = .4)) +
+  colScale +
+  labs(colour = 'Economic Size (rel) and:')
+
+p3
+pp1 <- plot_grid(p1, p2, p3, ncol = 1, labels = c('a', 'b', 'c'))
+# pp1
+# ggsave('figures_manuscript/Figure_4.png')
+@
+
+
+<<fig.cap='Boxplots of the types of farmers are in the group that was able to get out of poverty compared to those that are not able to get out of poverty when increasing the incomes by 2x.', out.width = '.95\\textwidth', size='footnotesize',fig.height=5, echo=F>>=
+tmp <- dat %>% select(id, country, poverty_line_2011_PPP, totincome,
+                      landown, rel_landown, rel_econsize,
+                      p_femLab, p_famLab, p_subsist)
+
+n = 2
+i = .4
+
+for (v in c('rel_landown', 'p_subsist', 'p_femLab', 'p_famLab')) {
+
+  tmp2 <- tmp
+  tmp2$totincome_nx <- ifelse(tmp[[v]] <= i & tmp[['rel_econsize']] <= i & tmp2$totincome >= 0,
+                              tmp2$totincome * n,
+                       ifelse(tmp[[v]] <= i & tmp[['rel_econsize']] <= i & tmp2$totincome < 0,
+                              tmp2$totincome + (abs(tmp2$totincome) * (n-1)),
+                              tmp2$totincome))
+
+  tmp2$subgroup <- ifelse(tmp2$totincome    < tmp2$poverty_line_2011_PPP &
+                          tmp2$totincome_nx > tmp2$poverty_line_2011_PPP,
+                          'A',
+                   ifelse(tmp2$totincome    < tmp2$poverty_line_2011_PPP &
+                          tmp2$totincome_nx < tmp2$poverty_line_2011_PPP,
+                          'B', 'C'))
+
+  tmp2 <- tmp2 %>%
+    # filter(subgroup == 'A') %>%
+    select(id, country, subgroup,
+           landown, rel_landown, rel_econsize,
+           p_femLab, p_famLab, p_subsist)
+
+  tmp2 <- melt(tmp2, id.vars = c('id', 'country', 'subgroup'))
+
+  fences <- tmp2 %>%
+    group_by(variable, subgroup) %>%
+    summarise(ul = quantile(value)[4] + 1.5 * IQR(value),
+              ll = quantile(value)[4] + 1.5 * IQR(value)) %>%
+    mutate(v = v)
+
+  stats_ <- tmp2 %>%
+    group_by(variable, subgroup) %>%
+    summarise(ymin = boxplot.stats(value)$stats[1],
+              lower = boxplot.stats(value)$stats[2],
+              middle = boxplot.stats(value)$stats[3],
+              upper = boxplot.stats(value)$stats[4],
+              ymax = boxplot.stats(value)$stats[5]) %>%
+    mutate(v = v)
+
+  if (v == 'rel_landown') {
+    out <- stats_
+  } else {
+    out <- rbind(out, stats_)
+  }
+}
+
+
+out <- merge(out, ivs, by.x = 'v', by.y = 'variable', all.x = T)
+colnames(ivs)[2] <- 'prop_names_facet'
+out <- merge(out, ivs, by.x = 'variable', by.y = 'variable', all.x = T)
+out$subgroup <- ifelse(out$subgroup == 'A', 'Transitioned out of poverty',
+                ifelse(out$subgroup == 'B', 'Still in poverty',
+                       'Never in Poverty'))
+
+ggplot(out, aes(x = subgroup,
+                fill = prop_names,
+                lower = lower,
+                upper = upper,
+                middle = middle,
+                ymin = ymin,
+                ymax = ymax)) +
+  geom_boxplot(stat = 'identity') +
+  labs(color = '') +
+  ylab('') +
+  xlab('') +
+  labs(fill = 'Economic Size (rel) and:') +
+  facet_wrap(~ prop_names_facet, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  #       axis.text.y = element_text(hjust = 1, size = 9),
+  #       axis.title = element_text(size = 9),
+  #       strip.text = element_text(size = 9))
+@
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\printbibliography
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\section*{Session information}
+<<sessionInfo, size='footnotesize', echo=F>>= 
+toLatex(sessionInfo())
+@ 
+
+
+
+\end{document}
